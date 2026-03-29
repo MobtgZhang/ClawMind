@@ -1,0 +1,29 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --surface: 255 255 255;
+  --surface-muted: 247 247 248;
+  --ink: 13 13 13;
+  --ink-muted: 102 102 110;
+  --accent: 16 163 127;
+}
+
+.dark {
+  --surface: 33 33 33;
+  --surface-muted: 43 43 43;
+  --ink: 236 236 241;
+  --ink-muted: 172 172 180;
+  --accent: 38 198 160;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  @apply bg-surface text-ink antialiased;
+}

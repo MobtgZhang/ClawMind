@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" fill="none" role="img" aria-label="ClawMind">
+  <defs>
+    <linearGradient id="cmg" x1="18" y1="14" x2="102" y2="106" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#14b8a6"/>
+      <stop offset="0.45" stop-color="#0d9488"/>
+      <stop offset="1" stop-color="#0f766e"/>
+    </linearGradient>
+    <linearGradient id="cmg2" x1="40" y1="28" x2="88" y2="92" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ffffff" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect width="120" height="120" rx="28" fill="url(#cmg)"/>
+  <path fill="url(#cmg2)" d="M28 24h64c8 0 14 6 14 14v48c0 8-6 14-14 14H28c-8 0-14-6-14-14V38c0-8 6-14 14-14z"/>
+  <!-- Stylized claw + mind node -->
+  <path fill="#f8fafc" fill-opacity="0.95" d="M78 38c-4 0-8 2-10 6l-6 14-4-10c-2-5-7-8-12-8-8 0-14 6-14 14 0 5 3 10 8 12l10 4-14 6c-4 2-6 6-6 10 0 7 6 13 13 13 4 0 8-2 10-6l6-14 4 10c2 5 7 8 12 8 8 0 14-6 14-14 0-5-3-10-8-12l-10-4 14-6c4-2 6-6 6-10 0-7-6-13-13-13z"/>
+  <circle cx="60" cy="62" r="7" fill="#0f766e"/>
+  <circle cx="60" cy="62" r="3.5" fill="#ecfdf5"/>
+</svg>
