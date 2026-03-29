@@ -1,0 +1,29 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      SYSTEM_PROMPT: ${SYSTEM_PROMPT:-你是一个有帮助的助手。}
+      LISTEN: ":8080"
+      DB_PATH: /data/clawmind.db
+      TOOLS_PATH: /app/config/tools.json
+    volumes:
+      - clawmind-data:/data
+    expose:
+      - "8080"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "8081:80"
+    depends_on:
+      - backend
+
+volumes:
+  clawmind-data:
