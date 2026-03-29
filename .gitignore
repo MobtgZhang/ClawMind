@@ -27,6 +27,20 @@ go.work.sum
 # env file
 .env
 
+# App
+.clawmind/
+backend/data/
+frontend/dist/
+frontend/node_modules/
+node_modules/
+
+# 构建产物
+bin/
+*.tsbuildinfo
+
+# 本地临时脚本（不上传）
+push.sh
+
 # Editor/IDE
 # .idea/
 # .vscode/
