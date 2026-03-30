@@ -67,13 +67,15 @@ func RunStream(
 	}
 
 	system := cfg.SystemPrompt
+	system += "\n\n" + systemRuntimeContextBlock(time.Now())
 	if mem != nil {
 		lines, _ := mem.RetrieveLevels(ctx, msg.SessionID, pid, "")
 		if len(lines) > 0 {
 			system += "\n\n多级记忆（L3 全局 → L2 项目 → L1 会话）：\n- " + strings.Join(lines, "\n- ")
 		}
 	}
-	system += "\n\n你是带工具的自进化助手。需要时调用工具；最终用清晰中文回答用户。"
+	prompts := loadPromptBundle(cfg.PromptsDir)
+	system += "\n\n" + prompts.SystemSuffix
 
 	runner := &ToolRunner{Workspace: cfg.Workspace, Client: client}
 
@@ -95,13 +97,13 @@ func RunStream(
 	phaseSystem := truncateRunes(system, 6000)
 
 	// --- 任务流程（流式） ---
-	planUser := "用 3 条以内的 Markdown 要点（以 - 开头）概括：用户要什么、你打算怎么做。不要调用工具，不要写最终答案。\n\n用户最新输入：\n" + lastUser
+	planUser := expandLastUser(prompts.TaskFlowUser, lastUser)
 	if err := streamPhaseMarkdown(ctx, client, cfg, phaseSystem, planUser, domain.PartTaskFlow, &parts, msg.ID, st, emitStartIdx, emitDeltaIdx, emitEndIdx); err != nil {
 		return err
 	}
 
 	// --- 思考流程（流式） ---
-	thinkUser := "用 2～4 句中文说明你的推理思路（Markdown，不写最终答案、不列工具结果）。\n\n用户最新输入：\n" + lastUser
+	thinkUser := expandLastUser(prompts.ThinkingUser, lastUser)
 	if err := streamPhaseMarkdown(ctx, client, cfg, phaseSystem, thinkUser, domain.PartThinking, &parts, msg.ID, st, emitStartIdx, emitDeltaIdx, emitEndIdx); err != nil {
 		return err
 	}
@@ -373,12 +375,15 @@ type RunConfig struct {
 	APIKey             string
 	Model              string
 	SystemPrompt       string
-	Temperature        float64
-	TopP               float64
-	TopK               *int
-	MaxAgentRounds     int
-	Workspace          string
-	ToolsJSON          json.RawMessage // JSON array of OpenAI tool defs
+	// PromptsDir is the directory containing system_suffix.md, task_flow_user.md, thinking_user.md.
+	// Empty: auto-resolve backend/data/prompts from cwd; missing files use built-in defaults.
+	PromptsDir     string
+	Temperature    float64
+	TopP           float64
+	TopK           *int
+	MaxAgentRounds int
+	Workspace      string
+	ToolsJSON      json.RawMessage // JSON array of OpenAI tool defs
 }
 
 // NewAssistantPlaceholder creates an empty assistant message after the user message.

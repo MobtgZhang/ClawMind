@@ -29,7 +29,10 @@ go.work.sum
 
 # App
 .clawmind/
-backend/data/
+# 本地 DB 等放在 backend/data/；默认提示词模板纳入版本库
+backend/data/**
+!backend/data/prompts/
+!backend/data/prompts/**
 frontend/dist/
 frontend/node_modules/
 node_modules/

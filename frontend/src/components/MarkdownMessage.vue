@@ -3,7 +3,8 @@ import { computed, ref } from "vue";
 import MarkdownIt from "markdown-it";
 import mdMultimdTable from "markdown-it-multimd-table";
 import hljs from "highlight.js";
-import "highlight.js/styles/github-dark.css";
+import "highlight.js/styles/github.css";
+import "@/styles/hljs-github-dark-scoped.css";
 
 const props = defineProps<{ source: string }>();
 const root = ref<HTMLElement | null>(null);

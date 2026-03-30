@@ -31,12 +31,11 @@ export interface SkillItem {
   description: string;
 }
 
-/** 与后端 GET/PUT /api/settings 及 .clawmind/config.json 对齐 */
+/** 与后端 GET/PUT /api/settings 及 .clawmind/config.json 对齐（系统提示仅由服务端 config / 环境变量决定，不在 UI 编辑） */
 export interface ServerSettings {
   openaiBaseUrl: string;
   openaiApiKey: string;
   openaiModel: string;
-  systemPrompt: string;
   temperature: number;
   topP: number;
   topK?: number;

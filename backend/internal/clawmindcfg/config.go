@@ -74,7 +74,7 @@ func Default() Config {
 		OpenAIBaseURL:  "https://api.openai.com/v1",
 		OpenAIAPIKey:   "",
 		OpenAIModel:    "gpt-4o-mini",
-		SystemPrompt:   "你是一个有帮助的助手。",
+		SystemPrompt:   "你是 ClawMind 中的 AI 助手，请诚实、准确、有条理地帮助用户。",
 		Temperature:    0.7,
 		TopP:           1,
 		TopK:           nil,
@@ -170,7 +170,7 @@ func (c Config) Resolved() Resolved {
 		out.Model = getenvDefault("OPENAI_MODEL", "gpt-4o-mini")
 	}
 	if out.SystemPrompt == "" {
-		out.SystemPrompt = getenvDefault("SYSTEM_PROMPT", "你是一个有帮助的助手。")
+		out.SystemPrompt = getenvDefault("SYSTEM_PROMPT", "你是 ClawMind 中的 AI 助手，请诚实、准确、有条理地帮助用户。")
 	}
 	out.APIKey = strings.TrimSpace(c.OpenAIAPIKey)
 	if out.APIKey == "" {

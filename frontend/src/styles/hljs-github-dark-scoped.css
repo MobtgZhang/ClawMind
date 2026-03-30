@@ -1,0 +1,86 @@
+/* GitHub Dark 高亮，仅作用于 markdown 代码块，避免浅色模式下全局浅色字不可读 */
+html.dark .md-code-wrap pre code.hljs {
+  display: block;
+  overflow-x: auto;
+  padding: 1em;
+}
+html.dark .md-code-wrap code.hljs {
+  padding: 3px 5px;
+}
+html.dark .md-code-wrap .hljs {
+  color: #c9d1d9;
+  background: transparent;
+}
+html.dark .md-code-wrap .hljs-doctag,
+html.dark .md-code-wrap .hljs-keyword,
+html.dark .md-code-wrap .hljs-meta .hljs-keyword,
+html.dark .md-code-wrap .hljs-template-tag,
+html.dark .md-code-wrap .hljs-template-variable,
+html.dark .md-code-wrap .hljs-type,
+html.dark .md-code-wrap .hljs-variable.language_ {
+  color: #ff7b72;
+}
+html.dark .md-code-wrap .hljs-title,
+html.dark .md-code-wrap .hljs-title.class_,
+html.dark .md-code-wrap .hljs-title.class_.inherited__,
+html.dark .md-code-wrap .hljs-title.function_ {
+  color: #d2a8ff;
+}
+html.dark .md-code-wrap .hljs-attr,
+html.dark .md-code-wrap .hljs-attribute,
+html.dark .md-code-wrap .hljs-literal,
+html.dark .md-code-wrap .hljs-meta,
+html.dark .md-code-wrap .hljs-number,
+html.dark .md-code-wrap .hljs-operator,
+html.dark .md-code-wrap .hljs-variable,
+html.dark .md-code-wrap .hljs-selector-attr,
+html.dark .md-code-wrap .hljs-selector-class,
+html.dark .md-code-wrap .hljs-selector-id {
+  color: #79c0ff;
+}
+html.dark .md-code-wrap .hljs-regexp,
+html.dark .md-code-wrap .hljs-string,
+html.dark .md-code-wrap .hljs-meta .hljs-string {
+  color: #a5d6ff;
+}
+html.dark .md-code-wrap .hljs-built_in,
+html.dark .md-code-wrap .hljs-symbol {
+  color: #ffa657;
+}
+html.dark .md-code-wrap .hljs-comment,
+html.dark .md-code-wrap .hljs-code,
+html.dark .md-code-wrap .hljs-formula {
+  color: #8b949e;
+}
+html.dark .md-code-wrap .hljs-name,
+html.dark .md-code-wrap .hljs-quote,
+html.dark .md-code-wrap .hljs-selector-tag,
+html.dark .md-code-wrap .hljs-selector-pseudo {
+  color: #7ee787;
+}
+html.dark .md-code-wrap .hljs-subst {
+  color: #c9d1d9;
+}
+html.dark .md-code-wrap .hljs-section {
+  color: #1f6feb;
+  font-weight: bold;
+}
+html.dark .md-code-wrap .hljs-bullet {
+  color: #f2cc60;
+}
+html.dark .md-code-wrap .hljs-emphasis {
+  color: #c9d1d9;
+  font-style: italic;
+}
+html.dark .md-code-wrap .hljs-strong {
+  color: #c9d1d9;
+  font-weight: bold;
+}
+html.dark .md-code-wrap .hljs-addition {
+  color: #aff5b4;
+  background-color: #033a16;
+}
+html.dark .md-code-wrap .hljs-deletion {
+  color: #ffdcd7;
+  background-color: #67060c;
+}

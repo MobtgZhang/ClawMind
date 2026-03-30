@@ -450,12 +450,14 @@ func (s *Server) stream(c *gin.Context) {
 		}
 	}
 	toolsJSON, _ := json.Marshal(s.toolDefinitions())
+	promptsDir := strings.TrimSpace(os.Getenv("AGENT_PROMPTS_DIR"))
 	cfg := agent.RunConfig{
 		AssistantMessageID: messageID,
 		BaseURL:            resolved.BaseURL,
 		APIKey:             resolved.APIKey,
 		Model:              model,
 		SystemPrompt:       resolved.SystemPrompt,
+		PromptsDir:         promptsDir,
 		Temperature:        resolved.Temperature,
 		TopP:               resolved.TopP,
 		TopK:               resolved.TopK,

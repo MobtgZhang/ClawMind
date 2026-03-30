@@ -33,7 +33,6 @@ function defaultServerSettings(): ServerSettings {
     openaiBaseUrl: "https://api.openai.com/v1",
     openaiApiKey: "",
     openaiModel: "gpt-4o-mini",
-    systemPrompt: "你是一个有帮助的助手。",
     temperature: 0.7,
     topP: 1,
     maxAgentRounds: 16,
@@ -136,7 +135,6 @@ export const useChatStore = defineStore("chat", () => {
       openaiBaseUrl: merged.openaiBaseUrl,
       openaiApiKey: merged.openaiApiKey,
       openaiModel: merged.openaiModel,
-      systemPrompt: merged.systemPrompt,
       temperature: merged.temperature,
       topP: merged.topP,
       maxAgentRounds: merged.maxAgentRounds,
@@ -425,7 +423,11 @@ export const useChatStore = defineStore("chat", () => {
     streamFinished.value = false;
     const res = await fetch(
       `/api/sessions/${sessionId}/stream?messageId=${encodeURIComponent(assistantMessageId)}`,
-      { signal }
+      {
+        signal,
+        cache: "no-store",
+        headers: { Accept: "text/event-stream" },
+      }
     );
     if (!res.ok || !res.body) {
       throw new Error("stream failed");

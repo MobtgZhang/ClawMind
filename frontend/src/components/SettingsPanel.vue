@@ -12,7 +12,6 @@ const form = reactive({
   openaiBaseUrl: "",
   openaiApiKey: "",
   openaiModel: "",
-  systemPrompt: "",
   temperature: 0.7,
   topP: 1,
   topK: 0 as number,
@@ -24,7 +23,6 @@ function syncFromStore() {
   form.openaiBaseUrl = s.openaiBaseUrl;
   form.openaiApiKey = s.openaiApiKey;
   form.openaiModel = s.openaiModel;
-  form.systemPrompt = s.systemPrompt;
   form.temperature = s.temperature;
   form.topP = s.topP;
   form.topK = s.topK ?? 0;
@@ -52,7 +50,6 @@ async function onSave() {
     openaiBaseUrl: form.openaiBaseUrl.trim(),
     openaiApiKey: form.openaiApiKey,
     openaiModel: form.openaiModel.trim(),
-    systemPrompt: form.systemPrompt,
     temperature: Number(form.temperature),
     topP: Number(form.topP),
     topK: form.topK > 0 ? Math.floor(form.topK) : 0,
@@ -154,13 +151,6 @@ async function onSave() {
           min="1"
           max="256"
           class="mt-1 w-full rounded-lg border border-ink/15 bg-surface-muted px-3 py-2 text-sm text-ink outline-none focus:border-accent"
-        />
-
-        <label class="mt-4 block text-xs font-medium text-ink-muted">系统提示</label>
-        <textarea
-          v-model="form.systemPrompt"
-          rows="4"
-          class="mt-1 w-full resize-none rounded-lg border border-ink/15 bg-surface-muted px-3 py-2 text-sm text-ink outline-none focus:border-accent"
         />
 
         <div class="mt-6 flex gap-2">
