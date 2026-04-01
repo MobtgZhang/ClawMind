@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -59,6 +60,7 @@ func RunStream(
 		}
 	}
 	upto = TrimHistoryByAssistantRounds(upto, cfg.MaxAgentRounds)
+	upto = TrimHistoryByEstimatedTokens(upto, cfg.MaxContextTokens)
 
 	lastUser := lastUserText(upto)
 	pid := ""
@@ -69,7 +71,8 @@ func RunStream(
 	system := cfg.SystemPrompt
 	system += "\n\n" + systemRuntimeContextBlock(time.Now())
 	if mem != nil {
-		lines, _ := mem.RetrieveLevels(ctx, msg.SessionID, pid, "")
+		memQuery := truncateRunes(strings.TrimSpace(lastUser), 512)
+		lines, _ := mem.RetrieveLevels(ctx, msg.SessionID, pid, memQuery)
 		if len(lines) > 0 {
 			system += "\n\n多级记忆（L3 全局 → L2 项目 → L1 会话）：\n- " + strings.Join(lines, "\n- ")
 		}
@@ -77,7 +80,7 @@ func RunStream(
 	prompts := loadPromptBundle(cfg.PromptsDir)
 	system += "\n\n" + prompts.SystemSuffix
 
-	runner := &ToolRunner{Workspace: cfg.Workspace, Client: client}
+	runner := &ToolRunner{Workspace: cfg.Workspace, Client: client, MCPCall: cfg.MCPCall}
 
 	var parts []domain.Part
 
@@ -122,7 +125,34 @@ func RunStream(
 		maxTools = 32
 	}
 
+	var tokenAccum int
+	recordUsage := func(res *llm.CompleteResult) {
+		if res == nil {
+			return
+		}
+		t := res.TotalTokens
+		if t <= 0 {
+			t = res.PromptTokens + res.CompletionTokens
+		}
+		tokenAccum += t
+		slog.Info("llm.completion_usage",
+			"prompt_tokens", res.PromptTokens,
+			"completion_tokens", res.CompletionTokens,
+			"total_tokens", t,
+			"accum", tokenAccum,
+			"assistant_message_id", cfg.AssistantMessageID,
+		)
+	}
+
 	for round := 0; round < maxTools; round++ {
+		if cfg.TokenBudget > 0 && tokenAccum > cfg.TokenBudget {
+			_ = onEvent(domain.StreamEvent{Type: domain.EventError, MessageID: msg.ID, Error: "已达到本次对话的 token 预算上限（CLAWMIND_TOKEN_BUDGET）"})
+			parts = append(parts, domain.Part{Type: domain.PartText, Text: "已停止：超出配置的 token 预算。"})
+			_ = st.UpdateMessageParts(ctx, msg.ID, cloneParts(parts))
+			_ = onEvent(domain.StreamEvent{Type: domain.EventDone, MessageID: msg.ID})
+			_ = st.TouchSession(ctx, msg.SessionID)
+			return nil
+		}
 		res, err := client.Complete(ctx, llm.CompleteParams{
 			BaseURL:     cfg.BaseURL,
 			APIKey:      cfg.APIKey,
@@ -142,6 +172,7 @@ func RunStream(
 			_ = st.TouchSession(ctx, msg.SessionID)
 			return nil
 		}
+		recordUsage(res)
 		if len(res.ToolCalls) == 0 {
 			// 模型直接文本结束：不再发起第二次补全，避免重复与额外费用。
 			if strings.TrimSpace(res.Content) != "" {
@@ -186,9 +217,40 @@ func RunStream(
 				ToolName:   tc.Name,
 				Arguments:  tc.Arguments,
 			})
-			out, rerr := runner.Run(ctx, tc.Name, tc.Arguments, cfg)
+			var out string
+			var rerr error
+			if tc.Name == "shell_exec" {
+				cmd := ShellCommandFromArgs(tc.Arguments)
+				if ShellRiskHigh(cmd) && cfg.WaitShellApproval != nil {
+					ok, aerr := cfg.WaitShellApproval(ctx, ShellApprovalRequest{
+						SessionID:      cfg.SessionID,
+						MessageID:      msg.ID,
+						ToolCallID:     tc.ID,
+						ToolName:       tc.Name,
+						Arguments:      tc.Arguments,
+						CommandSummary: truncateRunes(cmd, 240),
+					})
+					if aerr != nil {
+						out = "错误: " + aerr.Error()
+					} else if !ok {
+						out = "用户拒绝执行该 shell 命令。"
+					}
+				}
+				if out == "" {
+					t0 := time.Now()
+					out, rerr = runner.Run(ctx, tc.Name, tc.Arguments, cfg)
+					slog.Info("agent.tool", "name", tc.Name, "ms", time.Since(t0).Milliseconds(), "message_id", msg.ID)
+				}
+			} else {
+				t0 := time.Now()
+				out, rerr = runner.Run(ctx, tc.Name, tc.Arguments, cfg)
+				slog.Info("agent.tool", "name", tc.Name, "ms", time.Since(t0).Milliseconds(), "message_id", msg.ID)
+			}
 			if rerr != nil {
 				out = "错误: " + rerr.Error()
+			}
+			if rerr != nil || strings.HasPrefix(strings.TrimSpace(out), "错误:") {
+				reflexionAppend(ctx, client, cfg, &work, mem, msg.SessionID, pid, tc, out, recordUsage)
 			}
 			_ = onEvent(domain.StreamEvent{
 				Type:       domain.EventToolRes,
@@ -371,6 +433,7 @@ func streamPhaseMarkdown(
 // RunConfig controls one generation pass.
 type RunConfig struct {
 	AssistantMessageID string
+	SessionID          string
 	BaseURL            string
 	APIKey             string
 	Model              string
@@ -382,8 +445,56 @@ type RunConfig struct {
 	TopP           float64
 	TopK           *int
 	MaxAgentRounds int
-	Workspace      string
-	ToolsJSON      json.RawMessage // JSON array of OpenAI tool defs
+	MaxContextTokens int // <=0: skip token-based history trim
+	TokenBudget      int // <=0: no cap on accumulated completion usage per RunStream
+	Workspace        string
+	ToolsJSON        json.RawMessage // JSON array of OpenAI tool defs
+	WaitShellApproval func(context.Context, ShellApprovalRequest) (bool, error)
+	MCPCall           func(context.Context, string, string) (string, error)
+}
+
+func reflexionAppend(
+	ctx context.Context,
+	client *llm.Client,
+	cfg RunConfig,
+	work *[]llm.ChatMessage,
+	mem memory.Store,
+	sessionID, projectID string,
+	tc llm.ToolCallResult,
+	toolOut string,
+	recordUsage func(*llm.CompleteResult),
+) {
+	snippet := toolOut
+	if len(snippet) > 800 {
+		snippet = snippet[:800] + "…"
+	}
+	ref, err := client.Complete(ctx, llm.CompleteParams{
+		BaseURL:     cfg.BaseURL,
+		APIKey:      cfg.APIKey,
+		Model:       cfg.Model,
+		Messages: []llm.ChatMessage{
+			{Role: "system", Content: "用 2～4 句中文简要说明上一轮工具失败或异常的可能原因与下一步建议。不要调用工具。"},
+			{Role: "user", Content: "工具名: " + tc.Name + "\n输出:\n" + snippet},
+		},
+		Temperature: minFloat(cfg.Temperature, 0.35),
+		TopP:        cfg.TopP,
+		TopK:        cfg.TopK,
+	})
+	if err != nil || ref == nil {
+		return
+	}
+	recordUsage(ref)
+	txt := strings.TrimSpace(ref.Content)
+	if txt == "" {
+		return
+	}
+	*work = append(*work, llm.ChatMessage{
+		Role:    "user",
+		Content: "（内部反思，仅供参考）\n" + txt,
+	})
+	if mem != nil {
+		_ = mem.AppendLevel(ctx, sessionID, projectID, 1, "reflection", txt)
+	}
 }
 
 // NewAssistantPlaceholder creates an empty assistant message after the user message.

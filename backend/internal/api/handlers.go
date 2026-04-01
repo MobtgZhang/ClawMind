@@ -3,9 +3,11 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +19,7 @@ import (
 	"github.com/mobtgzhang/clawmind/backend/internal/clawmindcfg"
 	"github.com/mobtgzhang/clawmind/backend/internal/domain"
 	"github.com/mobtgzhang/clawmind/backend/internal/llm"
+	"github.com/mobtgzhang/clawmind/backend/internal/mcpclient"
 	"github.com/mobtgzhang/clawmind/backend/internal/memory"
 	"github.com/mobtgzhang/clawmind/backend/internal/store"
 	"github.com/mobtgzhang/clawmind/backend/internal/thread"
@@ -29,12 +32,15 @@ type Server struct {
 	Cfg        *clawmindcfg.Manager
 	LLM        *llm.Client
 	Mem        memory.Store
+	MCP        *mcpclient.Session
 	ToolsPath  string // e.g. ./config/tools.json
 	SkillsPath string // e.g. .clawmind/skills.json
 
-	mu       sync.Mutex
-	streams  map[string]streamEntry
-	streamID uint64
+	mu               sync.Mutex
+	streams          map[string]streamEntry
+	streamID         uint64
+	muApproval       sync.Mutex
+	pendingApprovals map[string]chan bool
 }
 
 type streamEntry struct {
@@ -42,7 +48,7 @@ type streamEntry struct {
 	cancel context.CancelFunc
 }
 
-func NewServer(st *store.Store, cfg *clawmindcfg.Manager, client *llm.Client, mem memory.Store, toolsPath, skillsPath string) *Server {
+func NewServer(st *store.Store, cfg *clawmindcfg.Manager, client *llm.Client, mem memory.Store, toolsPath, skillsPath string, mcp *mcpclient.Session) *Server {
 	if mem == nil {
 		mem = memory.NoopStore{}
 	}
@@ -50,20 +56,26 @@ func NewServer(st *store.Store, cfg *clawmindcfg.Manager, client *llm.Client, me
 		cfg = clawmindcfg.NewManager(".clawmind")
 	}
 	return &Server{
-		Store:      st,
-		Cfg:        cfg,
-		LLM:        client,
-		Mem:        mem,
-		ToolsPath:  toolsPath,
-		SkillsPath: skillsPath,
-		streams:    make(map[string]streamEntry),
+		Store:            st,
+		Cfg:              cfg,
+		LLM:              client,
+		Mem:              mem,
+		MCP:              mcp,
+		ToolsPath:        toolsPath,
+		SkillsPath:       skillsPath,
+		streams:          make(map[string]streamEntry),
+		pendingApprovals: make(map[string]chan bool),
 	}
 }
 
 func (s *Server) toolDefinitions() []tools.Definition {
 	fileReg, _ := tools.Load(s.ToolsPath)
 	userReg, _ := tools.Load(s.SkillsPath)
-	return tools.MergeDefinitions(tools.AtomicTools(), fileReg.Tools, userReg.Tools)
+	out := tools.MergeDefinitions(tools.AtomicTools(), fileReg.Tools, userReg.Tools)
+	if s.MCP != nil {
+		out = tools.MergeDefinitions(out, s.MCP.Definitions())
+	}
+	return out
 }
 
 func (s *Server) Register(r *gin.Engine) {
@@ -90,6 +102,7 @@ func (s *Server) Register(r *gin.Engine) {
 		api.POST("/sessions/:id/messages/:mid/regenerate", s.regenerateAssistant)
 		api.GET("/sessions/:id/stream", s.stream)
 		api.POST("/sessions/:id/messages/:mid/cancel", s.cancelStream)
+		api.POST("/sessions/:id/tool-approval", s.postToolApproval)
 	}
 }
 
@@ -372,6 +385,31 @@ func (s *Server) cancelStream(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
+type toolApprovalReq struct {
+	ApprovalID string `json:"approvalId"`
+	Approve    bool   `json:"approve"`
+}
+
+func (s *Server) postToolApproval(c *gin.Context) {
+	var body toolApprovalReq
+	if err := c.ShouldBindJSON(&body); err != nil || strings.TrimSpace(body.ApprovalID) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "approvalId required"})
+		return
+	}
+	s.muApproval.Lock()
+	ch, ok := s.pendingApprovals[body.ApprovalID]
+	s.muApproval.Unlock()
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "unknown or expired approval"})
+		return
+	}
+	select {
+	case ch <- body.Approve:
+	default:
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
 func (s *Server) stream(c *gin.Context) {
 	sid := c.Param("id")
 	messageID := c.Query("messageId")
@@ -451,8 +489,21 @@ func (s *Server) stream(c *gin.Context) {
 	}
 	toolsJSON, _ := json.Marshal(s.toolDefinitions())
 	promptsDir := strings.TrimSpace(os.Getenv("AGENT_PROMPTS_DIR"))
+	maxCtx := 24000
+	if v := strings.TrimSpace(os.Getenv("CLAWMIND_MAX_CONTEXT_TOKENS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxCtx = n
+		}
+	}
+	tokBudget := 0
+	if v := strings.TrimSpace(os.Getenv("CLAWMIND_TOKEN_BUDGET")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			tokBudget = n
+		}
+	}
 	cfg := agent.RunConfig{
 		AssistantMessageID: messageID,
+		SessionID:          sid,
 		BaseURL:            resolved.BaseURL,
 		APIKey:             resolved.APIKey,
 		Model:              model,
@@ -462,8 +513,52 @@ func (s *Server) stream(c *gin.Context) {
 		TopP:               resolved.TopP,
 		TopK:               resolved.TopK,
 		MaxAgentRounds:     resolved.MaxAgentRounds,
+		MaxContextTokens:   maxCtx,
+		TokenBudget:        tokBudget,
 		Workspace:          workspace,
 		ToolsJSON:          toolsJSON,
+	}
+	if s.MCP != nil {
+		cfg.MCPCall = s.MCP.CallTool
+	}
+	cfg.WaitShellApproval = func(ctx context.Context, req agent.ShellApprovalRequest) (bool, error) {
+		id := uuid.NewString()
+		ch := make(chan bool, 1)
+		s.muApproval.Lock()
+		s.pendingApprovals[id] = ch
+		s.muApproval.Unlock()
+		defer func() {
+			s.muApproval.Lock()
+			delete(s.pendingApprovals, id)
+			s.muApproval.Unlock()
+		}()
+		if err := send(domain.StreamEvent{
+			Type:       domain.EventToolApprovalReq,
+			MessageID:  messageID,
+			SessionID:  sid,
+			ApprovalID: id,
+			ToolCallID: req.ToolCallID,
+			ToolName:   req.ToolName,
+			Arguments:  req.CommandSummary,
+		}); err != nil {
+			return false, err
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case ok := <-ch:
+			approved := ok
+			_ = send(domain.StreamEvent{
+				Type:       domain.EventToolApprovalRes,
+				MessageID:  messageID,
+				SessionID:  sid,
+				ApprovalID: id,
+				Approved:   &approved,
+			})
+			return ok, nil
+		case <-time.After(5 * time.Minute):
+			return false, fmt.Errorf("确认超时")
+		}
 	}
 	_ = agent.RunStream(genCtx, s.Store, s.Mem, s.LLM, cfg, send)
 }

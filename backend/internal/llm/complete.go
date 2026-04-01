@@ -34,6 +34,10 @@ type ToolCallResult struct {
 type CompleteResult struct {
 	Content   string
 	ToolCalls []ToolCallResult
+	// Usage from provider (optional).
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
 }
 
 type completeResponse struct {
@@ -51,6 +55,11 @@ type completeResponse struct {
 			} `json:"tool_calls"`
 		} `json:"message"`
 	} `json:"choices"`
+	Usage *struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+	} `json:"usage"`
 }
 
 // Complete performs POST /chat/completions with stream=false.
@@ -132,6 +141,11 @@ func (c *Client) Complete(ctx context.Context, p CompleteParams) (*CompleteResul
 			Name:      tc.Function.Name,
 			Arguments: tc.Function.Arguments,
 		})
+	}
+	if cr.Usage != nil {
+		out.PromptTokens = cr.Usage.PromptTokens
+		out.CompletionTokens = cr.Usage.CompletionTokens
+		out.TotalTokens = cr.Usage.TotalTokens
 	}
 	return out, nil
 }

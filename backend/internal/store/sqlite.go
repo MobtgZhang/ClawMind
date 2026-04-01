@@ -40,6 +40,9 @@ func Open(path string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// DB returns the underlying *sql.DB for modules that share the same SQLite file (e.g. agent memory).
+func (s *Store) DB() *sql.DB { return s.db }
+
 func (s *Store) migrate() error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS sessions (
@@ -74,6 +77,30 @@ func (s *Store) migrate() error {
 	}
 	if _, err := s.db.Exec(`ALTER TABLE sessions ADD COLUMN project_id TEXT REFERENCES projects(id) ON DELETE SET NULL`); err != nil {
 		if !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			return err
+		}
+	}
+	memStmts := []string{
+		`CREATE TABLE IF NOT EXISTS agent_memory (
+  id TEXT PRIMARY KEY,
+  level INTEGER NOT NULL,
+  session_id TEXT NOT NULL DEFAULT '',
+  project_id TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL,
+  content TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);`,
+		`CREATE INDEX IF NOT EXISTS idx_agent_memory_session_level ON agent_memory(session_id, level, created_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_agent_memory_project_level ON agent_memory(project_id, level, created_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_agent_memory_level_time ON agent_memory(level, created_at);`,
+		`CREATE TABLE IF NOT EXISTS agent_memory_embedding (
+  memory_id TEXT PRIMARY KEY REFERENCES agent_memory(id) ON DELETE CASCADE,
+  dim INTEGER NOT NULL,
+  embedding BLOB NOT NULL
+);`,
+	}
+	for _, q := range memStmts {
+		if _, err := s.db.Exec(q); err != nil {
 			return err
 		}
 	}

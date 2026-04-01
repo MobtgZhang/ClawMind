@@ -463,6 +463,18 @@ export const useChatStore = defineStore("chat", () => {
           }
           streamingBuffers.value[mid] = (streamingBuffers.value[mid] ?? "") + ev.text;
         }
+        if (ev.type === "tool_approval_request" && ev.approvalId && ev.sessionId) {
+          const preview = (ev.arguments ?? "").trim() || ev.toolName || "shell 命令";
+          const ok = window.confirm(`高危 shell 需确认（来自 Agent）：\n\n${preview.slice(0, 800)}`);
+          void fetch(
+            `/api/sessions/${encodeURIComponent(ev.sessionId)}/tool-approval`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ approvalId: ev.approvalId, approve: ok }),
+            }
+          ).catch(() => {});
+        }
         if (ev.type === "tool_call" && ev.toolCallId) {
           const cur = [...(streamingToolSteps.value[mid] ?? [])];
           cur.push({

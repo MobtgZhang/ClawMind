@@ -1,17 +1,21 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 	"github.com/mobtgzhang/clawmind/backend/internal/api"
 	"github.com/mobtgzhang/clawmind/backend/internal/clawmindcfg"
 	"github.com/mobtgzhang/clawmind/backend/internal/llm"
+	"github.com/mobtgzhang/clawmind/backend/internal/mcpclient"
 	"github.com/mobtgzhang/clawmind/backend/internal/memory"
 	"github.com/mobtgzhang/clawmind/backend/internal/store"
 )
@@ -36,8 +40,6 @@ func main() {
 	client := llm.NewClient(llm.Config{
 		HTTPClient: llm.DefaultHTTPClient(),
 	})
-	mem := memory.NewInMemoryStore()
-	toolsPath := getenv("TOOLS_PATH", "./config/tools.json")
 
 	wd, err := os.Getwd()
 	if err != nil {
@@ -60,8 +62,47 @@ func main() {
 	}
 	slog.Info("config file", "path", cfgMgr.ConfigPath())
 
+	fileCfg, _ := cfgMgr.Load()
+	resolved := fileCfg.Resolved()
+
+	var mem memory.Store
+	memBackend := strings.ToLower(strings.TrimSpace(os.Getenv("CLAWMIND_MEMORY_BACKEND")))
+	if memBackend == "memory" {
+		mem = memory.NewInMemoryStore()
+		slog.Info("memory backend", "mode", "in-memory")
+	} else {
+		sqlMem := memory.NewSQLiteStore(st.DB())
+		if k, err := strconv.Atoi(strings.TrimSpace(os.Getenv("CLAWMIND_MEMORY_SEMANTIC_TOP_K"))); err == nil && k > 0 {
+			sqlMem.SemanticTopK = k
+		}
+		emModel := strings.TrimSpace(os.Getenv("CLAWMIND_EMBEDDING_MODEL"))
+		if emModel != "" {
+			sqlMem.Embed = func(ctx context.Context, text string) ([]float32, error) {
+				return client.EmbedText(ctx, resolved.BaseURL, resolved.APIKey, emModel, text)
+			}
+			slog.Info("memory semantic RAG", "embeddingModel", emModel)
+		}
+		mem = sqlMem
+		slog.Info("memory backend", "mode", "sqlite")
+	}
+
+	var mcpSess *mcpclient.Session
+	if mcpCmd := strings.TrimSpace(os.Getenv("CLAWMIND_MCP_COMMAND")); mcpCmd != "" {
+		mctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		sess, err := mcpclient.Connect(mctx, mcpCmd, splitPipeArgs(os.Getenv("CLAWMIND_MCP_ARGS")), parseEnvPairs(os.Getenv("CLAWMIND_MCP_ENV")))
+		cancel()
+		if err != nil {
+			slog.Warn("mcp connect failed", "err", err)
+		} else {
+			mcpSess = sess
+			slog.Info("mcp connected", "tools", len(sess.Definitions()))
+			defer func() { _ = sess.Close() }()
+		}
+	}
+
+	toolsPath := getenv("TOOLS_PATH", "./config/tools.json")
 	skillsPath := filepath.Join(clawDir, "skills.json")
-	srv := api.NewServer(st, cfgMgr, client, mem, toolsPath, skillsPath)
+	srv := api.NewServer(st, cfgMgr, client, mem, toolsPath, skillsPath, mcpSess)
 	slog.Info("skills file", "path", skillsPath)
 
 	gin.SetMode(gin.ReleaseMode)
@@ -79,6 +120,25 @@ func main() {
 		slog.Error("server", "err", err)
 		os.Exit(1)
 	}
+}
+
+func splitPipeArgs(s string) []string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, "|")
+}
+
+func parseEnvPairs(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ";") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func getenv(k, def string) string {

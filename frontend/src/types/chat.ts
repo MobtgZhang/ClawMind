@@ -69,6 +69,8 @@ export type StreamEventType =
   | "part_end"
   | "tool_call"
   | "tool_result"
+  | "tool_approval_request"
+  | "tool_approval_result"
   | "done"
   | "error";
 
@@ -83,6 +85,9 @@ export interface StreamEvent {
   arguments?: string;
   result?: string;
   error?: string;
+  approvalId?: string;
+  sessionId?: string;
+  approved?: boolean;
 }
 
 /** 采样预设（与设置页按钮一致） */

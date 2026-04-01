@@ -72,8 +72,16 @@ npm install && npm run dev
 | `CLAWMIND_DIR` | `.clawmind` 目录（`config.json`、`skills.json`） |
 | `TOOLS_PATH` | 额外工具 JSON，与内置原子工具合并 |
 | `AGENT_WORKSPACE` | Agent 文件与 Shell 的工作区根路径 |
+| `CLAWMIND_MEMORY_BACKEND` | `sqlite`（默认）或 `memory`（进程内记忆，测试用） |
+| `CLAWMIND_EMBEDDING_MODEL` | 非空则启用记忆语义检索（OpenAI 兼容 `embeddings`） |
+| `CLAWMIND_MEMORY_SEMANTIC_TOP_K` | 语义检索条数，默认 8 |
+| `CLAWMIND_MAX_CONTEXT_TOKENS` | 历史消息估算 token 上限，默认 24000 |
+| `CLAWMIND_TOKEN_BUDGET` | 单次回复链路累计 token 软上限，0 不限制 |
+| `CLAWMIND_MCP_COMMAND` | MCP stdio 可执行文件（如 `npx`），空则禁用 |
+| `CLAWMIND_MCP_ARGS` | 以 `\|` 分隔的参数片段，如 `-y\|@modelcontextprotocol/server-filesystem\|/tmp` |
+| `CLAWMIND_MCP_ENV` | 额外环境变量，`KEY=VAL;KEY2=VAL2` |
 
-内置工具：`file_read`、`file_write`、`shell_exec`、`web_fetch`、`task_plan`、`task_summary`。多级内存 **L0–L3** 见 [docs/features.md](docs/features.md)。
+内置工具：`file_read`、`file_write`、`shell_exec`、`web_fetch`、`task_plan`、`task_summary`。多级内存 **L0–L3** 见 [docs/features.md](docs/features.md)；演进与 MCP/SSE 契约见 [docs/architecture-evolution.md](docs/architecture-evolution.md)。
 
 ## API 摘要
 

@@ -63,13 +63,15 @@ type Message struct {
 type StreamEventType string
 
 const (
-	EventDelta     StreamEventType = "delta"
-	EventPartStart StreamEventType = "part_start"
-	EventPartEnd   StreamEventType = "part_end"
-	EventToolCall  StreamEventType = "tool_call"
-	EventToolRes   StreamEventType = "tool_result"
-	EventDone      StreamEventType = "done"
-	EventError     StreamEventType = "error"
+	EventDelta             StreamEventType = "delta"
+	EventPartStart         StreamEventType = "part_start"
+	EventPartEnd           StreamEventType = "part_end"
+	EventToolCall          StreamEventType = "tool_call"
+	EventToolRes           StreamEventType = "tool_result"
+	EventToolApprovalReq   StreamEventType = "tool_approval_request"
+	EventToolApprovalRes   StreamEventType = "tool_approval_result"
+	EventDone              StreamEventType = "done"
+	EventError             StreamEventType = "error"
 )
 
 // StreamEvent is JSON sent as each SSE data line.
@@ -84,4 +86,7 @@ type StreamEvent struct {
 	Arguments  string          `json:"arguments,omitempty"`
 	Result     string          `json:"result,omitempty"`
 	Error      string          `json:"error,omitempty"`
+	ApprovalID string          `json:"approvalId,omitempty"`
+	SessionID  string          `json:"sessionId,omitempty"`
+	Approved   *bool           `json:"approved,omitempty"`
 }
