@@ -421,14 +421,28 @@ export const useChatStore = defineStore("chat", () => {
 
   async function consumeStream(sessionId: string, assistantMessageId: string, signal: AbortSignal) {
     streamFinished.value = false;
-    const res = await fetch(
-      `/api/sessions/${sessionId}/stream?messageId=${encodeURIComponent(assistantMessageId)}`,
-      {
-        signal,
-        cache: "no-store",
-        headers: { Accept: "text/event-stream" },
+    const url = `/api/sessions/${sessionId}/stream?messageId=${encodeURIComponent(assistantMessageId)}`;
+    let res: Response | undefined;
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        res = await fetch(url, {
+          signal,
+          cache: "no-store",
+          headers: { Accept: "text/event-stream" },
+        });
+        break;
+      } catch (e) {
+        lastErr = e;
+        if (signal.aborted || (e as Error).name === "AbortError") throw e;
+        if (attempt < 2) {
+          await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
+        }
       }
-    );
+    }
+    if (!res) {
+      throw lastErr instanceof Error ? lastErr : new Error("stream connect failed");
+    }
     if (!res.ok || !res.body) {
       throw new Error("stream failed");
     }

@@ -2,6 +2,10 @@
 import { computed, ref } from "vue";
 import MarkdownIt from "markdown-it";
 import mdMultimdTable from "markdown-it-multimd-table";
+import mdTexmath from "markdown-it-texmath";
+import katex from "katex";
+import "katex/dist/katex.min.css";
+import "markdown-it-texmath/css/texmath.css";
 import hljs from "highlight.js";
 import "highlight.js/styles/github.css";
 import "@/styles/hljs-github-dark-scoped.css";
@@ -50,7 +54,13 @@ const md = new MarkdownIt({
   linkify: true,
   breaks: true,
   highlight: () => "",
-}).use(mdMultimdTable);
+})
+  .use(mdMultimdTable)
+  .use(mdTexmath, {
+    engine: katex,
+    delimiters: "dollars",
+    katexOptions: { throwOnError: false },
+  });
 
 md.renderer.rules.fence = function (tokens, idx) {
   const token = tokens[idx];
