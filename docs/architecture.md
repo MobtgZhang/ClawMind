@@ -33,7 +33,7 @@ flowchart LR
 | 层级 | 技术 |
 |------|------|
 | 前端 | Vue 3、Vite、TypeScript、Pinia、Tailwind CSS、markdown-it、markdown-it-multimd-table（表格）、highlight.js |
-| 后端 | Go 1.22+、Gin、SQLite（mattn/go-sqlite3，需 CGO） |
+| 后端 | Go 1.22+、Gin、SQLite（`modernc.org/sqlite`，纯 Go，无需 CGO） |
 | 协议 | REST JSON、SSE（`text/event-stream`）承载流式事件 |
 
 ## 目录与模块（后端）
@@ -43,11 +43,11 @@ flowchart LR
 | `cmd/server` | 入口：环境变量、`CLAWMIND_DIR`、数据库路径、路由注册 |
 | `internal/api` | HTTP 处理器：会话、消息、流、设置、项目、技能 |
 | `internal/agent` | 编排：任务/思考流式段、工具循环、最终流式回答、记忆写入 |
-| `internal/llm` | OpenAI 兼容 `chat/completions`：流式与非流式、消息与 tools 载荷 |
+| `internal/llm` | `Provider` 接口（Complete / StreamChat）；默认 `Client` 为 OpenAI 兼容 `chat/completions` |
 | `internal/clawmindcfg` | `.clawmind/config.json` 读写与解析、环境变量兜底 |
 | `internal/store` | SQLite：sessions、messages、projects |
 | `internal/tools` | 工具定义合并：内置 + 文件 + skills.json |
-| `internal/memory` | 分层内存接口与进程内实现 |
+| `internal/memory` | 分层内存：`Store` 接口；**默认** `SQLiteStore`（与主库同库持久化 L1–L3）；`CLAWMIND_MEMORY_BACKEND=memory` 时为进程内实现 |
 
 ## 目录与模块（前端）
 
@@ -67,17 +67,26 @@ flowchart LR
    - 流式输出 **任务流程**、**思考**（各为独立 `partIndex`）；
    - `Complete` + 工具执行循环（若有）；
    - 最后对 **正文** 再 `StreamChat`，增量写回 SQLite 并推送 `delta`。
-4. 事件类型见 `internal/domain` 中 `StreamEvent`（`part_start` / `delta` / `part_end` / `tool_call` / `tool_result` / `done` / `error`）。
+4. 事件类型见 `internal/domain` 中 `StreamEvent`（`part_start` / `delta` / `part_end` / `tool_call` / `tool_result` / `done` / `error` / `tool_approval_request` / `tool_approval_result`）。
+5. **取消生成**：客户端关闭 SSE 或调用 `POST /api/sessions/:id/messages/:mid/cancel` 会取消本次 `RunStream` 的 Context，停止后续 LLM 与工具调用。
 
 ## 配置与环境
 
 - **`CLAWMIND_DIR`**：配置根目录；未设置时，在 `backend/` 下启动则指向 `../.clawmind`。
 - **`TOOLS_PATH`**：额外工具 JSON，相对后端进程工作目录。
 - **`AGENT_WORKSPACE`**：Agent 文件与 Shell 的根路径。
+- **`CLAWMIND_MEMORY_BACKEND`**：默认 sqlite（持久化）；`memory` 为进程内（测试用）。
+- **`CLAWMIND_TOKEN_BUDGET`**：单次流式生成 completion token 软上限，`0` 不限制。
+- 更多变量见 [architecture-evolution.md](architecture-evolution.md) 环境变量表。
+
+## 延伸阅读
+
+- [目标架构与安全边界](architecture-target.md)
+- [Skills 与 OpenClaw 路线图](skills-roadmap.md)
 
 ## 构建与运行
 
-- 后端：`CGO_ENABLED=1 go run ./cmd/server`（或根目录 `make run`）。
+- 后端：`go run ./cmd/server`（或根目录 `make run`）；无需 CGO。
 - 前端：`npm run dev`，Vite 将 `/api` 代理到后端。
 
 更详细的运行方式见根目录 [README.md](../README.md)。

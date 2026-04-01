@@ -6,13 +6,13 @@
 
 | 维度 | 现状 | 目标 | 主要模块 |
 |------|------|------|----------|
-| L1–L3 记忆 | 进程内 `InMemoryStore`，重启丢失 | SQLite 持久化表 `agent_memory` / `agent_memory_embedding`；可选语义检索 | `internal/memory`, `internal/store` |
-| 语义检索 | 子串匹配 | OpenAI 兼容 `embeddings` + 余弦相似度 top-k 注入 system | `internal/llm/embed.go`, `memory.SQLiteStore` |
+| L1–L3 记忆 | **默认** `SQLiteStore` 持久化；`memory` 后端为进程内 | 继续完善语义检索与裁剪策略；可选与主库分文件 | `internal/memory`, `internal/store` |
+| 语义检索 | 子串匹配 | OpenAI 兼容 `embeddings` + 余弦相似度 top-k 注入 system | `internal/llm/embeddings.go`, `memory.SQLiteStore` |
 | 反思 | 工具错误字符串直接进入下一轮 | Reflexion：失败时短补全写入上下文（可选写入 L1） | `internal/agent` |
-| 高危 Shell | 仅工作区路径约束 | Autonomy Tier：`shell_exec` 风险分级，SSE `tool_approval_request` + REST 批准 | `domain`, `api`, `frontend` |
+| 高危 Shell | 工作区约束 + 启发式高危 + SSE 确认 | 更强 denylist、超时与文档化沙箱部署建议 | `agent/shell_policy`, `api`, `frontend` |
 | 工具生态 | 静态 JSON 合并 | MCP：可选 stdio 子进程客户端，工具合并进 registry | `internal/mcpclient`, `cmd/server` |
 | 上下文 | 按助手轮数裁剪 | 估算 token 预算 + 轮数裁剪组合 | `internal/agent/trim.go` |
-| 可观测性 | SSE 过程事件 | `slog` 记录 completion usage、工具耗时；可选 `CLAWMIND_TOKEN_BUDGET` | `internal/llm` |
+| 可观测性 | SSE 过程事件；可选 `CLAWMIND_TOKEN_BUDGET` | `slog` 记录 completion usage、工具耗时；速率限制（多用户场景） | `internal/llm`, `internal/api` |
 
 ## 目标架构（Mermaid）
 
@@ -95,6 +95,6 @@ flowchart TB
 
 ## 风险说明
 
-- **CGO / SQLite**：与现有 `mattn/go-sqlite3` 一致，需本机编译环境。
+- **SQLite**：使用 `modernc.org/sqlite` 纯 Go 驱动，默认无需 CGO，便于交叉编译与精简镜像。
 - **Embedding 成本**：每条记忆写入会调用一次 embedding API（可仅在生产开启 `CLAWMIND_EMBEDDING_MODEL`）。
 - **SSE 阻塞**：人机确认会阻塞 Agent 循环直至 POST；断连时以取消上下文为准。

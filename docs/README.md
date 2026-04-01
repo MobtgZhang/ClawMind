@@ -7,6 +7,8 @@
 | [特点与能力](features.md) | 产品特性、Agent、工具、记忆与界面 |
 | [架构说明](architecture.md) | 技术栈、模块划分、数据流与配置 |
 | [演进架构与路线图](architecture-evolution.md) | 相对 content1 的差距、目标架构、SSE/MCP 契约与环境变量 |
+| [目标架构与安全边界](architecture-target.md) | 安全边界、数据层、LLM 适配、SSE 生命周期 |
+| [Skills 路线图](skills-roadmap.md) | 与 OpenClaw SKILL.md 生态差异与分阶段规划 |
 
 ## 品牌资源
 
