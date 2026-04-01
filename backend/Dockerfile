@@ -1,14 +1,13 @@
 FROM golang:1.22-bookworm AS build
-RUN apt-get update && apt-get install -y libsqlite3-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-ENV CGO_ENABLED=1
+ENV CGO_ENABLED=0
 RUN go build -ldflags="-s -w" -o /out/server ./cmd/server
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates libsqlite3-0 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /out/server ./server
 COPY config ./config

@@ -12,15 +12,15 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
-	"time"
 
 	"github.com/mobtgzhang/clawmind/backend/internal/llm"
+	"github.com/mobtgzhang/clawmind/backend/internal/security"
 )
 
 // ToolRunner executes model-selected tools under workspace constraints.
 type ToolRunner struct {
 	Workspace string
-	Client    *llm.Client
+	Client    llm.Provider
 	// MCPCall handles tools not implemented locally (e.g. MCP server).
 	MCPCall func(ctx context.Context, name string, argsJSON string) (string, error)
 }
@@ -58,6 +58,9 @@ func (r *ToolRunner) Run(ctx context.Context, name, argsJSON string, cfg RunConf
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 			return "", err
 		}
+		if security.BlockAgentReadPath(a.Path) {
+			return "", fmt.Errorf("file_read: path is blocked (local API key / config)")
+		}
 		full, err := r.safePath(a.Path)
 		if err != nil {
 			return "", err
@@ -77,6 +80,9 @@ func (r *ToolRunner) Run(ctx context.Context, name, argsJSON string, cfg RunConf
 		}
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 			return "", err
+		}
+		if security.BlockAgentWritePath(a.Path) {
+			return "", fmt.Errorf("file_write: path is blocked (local API key / config)")
 		}
 		full, err := r.safePath(a.Path)
 		if err != nil {
@@ -100,7 +106,7 @@ func (r *ToolRunner) Run(ctx context.Context, name, argsJSON string, cfg RunConf
 		if cmd == "" {
 			return "", fmt.Errorf("empty command")
 		}
-		cctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		cctx, cancel := context.WithTimeout(ctx, ShellExecTimeout)
 		defer cancel()
 		var c *exec.Cmd
 		if runtime.GOOS == "windows" {
@@ -126,8 +132,8 @@ func (r *ToolRunner) Run(ctx context.Context, name, argsJSON string, cfg RunConf
 			return "", err
 		}
 		u := strings.TrimSpace(a.URL)
-		if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
-			return "", fmt.Errorf("only http/https URLs")
+		if err := security.ValidateWebFetchURL(u); err != nil {
+			return "", fmt.Errorf("web_fetch: %w", err)
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if err != nil {

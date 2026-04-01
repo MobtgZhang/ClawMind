@@ -29,7 +29,7 @@ func RunStream(
 	ctx context.Context,
 	st MessageUpdater,
 	mem memory.Store,
-	client *llm.Client,
+	client llm.Provider,
 	cfg RunConfig,
 	onEvent func(domain.StreamEvent) error,
 ) error {
@@ -125,6 +125,9 @@ func RunStream(
 		maxTools = 32
 	}
 
+	var hitToolRoundCap bool
+	var prevToolRoundSig string
+
 	var tokenAccum int
 	recordUsage := func(res *llm.CompleteResult) {
 		if res == nil {
@@ -196,6 +199,29 @@ func RunStream(
 			break
 		}
 
+		if round == maxTools-1 {
+			hitToolRoundCap = true
+		}
+
+		var sigBuilder strings.Builder
+		for _, tc := range res.ToolCalls {
+			sigBuilder.WriteString(tc.Name)
+			sigBuilder.WriteByte(0)
+			sigBuilder.WriteString(tc.Arguments)
+			sigBuilder.WriteByte(30)
+		}
+		toolSig := sigBuilder.String()
+		if toolSig != "" && toolSig == prevToolRoundSig {
+			warn := "检测到连续两轮相同的工具调用，已停止以免无效循环。"
+			_ = onEvent(domain.StreamEvent{Type: domain.EventError, MessageID: msg.ID, Error: warn})
+			parts = append(parts, domain.Part{Type: domain.PartText, Text: warn})
+			_ = st.UpdateMessageParts(ctx, msg.ID, cloneParts(parts))
+			_ = onEvent(domain.StreamEvent{Type: domain.EventDone, MessageID: msg.ID})
+			_ = st.TouchSession(ctx, msg.SessionID)
+			return nil
+		}
+		prevToolRoundSig = toolSig
+
 		var tco []llm.ToolCallOut
 		for _, tc := range res.ToolCalls {
 			tco = append(tco, llm.ToolCallOut{
@@ -221,7 +247,10 @@ func RunStream(
 			var rerr error
 			if tc.Name == "shell_exec" {
 				cmd := ShellCommandFromArgs(tc.Arguments)
-				if ShellRiskHigh(cmd) && cfg.WaitShellApproval != nil {
+				if ShellCommandDenied(cmd) {
+					out = "错误: 该命令被安全策略禁止执行（命中 shell denylist）。"
+				}
+				if out == "" && ShellRiskHigh(cmd) && cfg.WaitShellApproval != nil {
 					ok, aerr := cfg.WaitShellApproval(ctx, ShellApprovalRequest{
 						SessionID:      cfg.SessionID,
 						MessageID:      msg.ID,
@@ -277,6 +306,16 @@ func RunStream(
 			})
 			_ = st.UpdateMessageParts(ctx, msg.ID, cloneParts(parts))
 		}
+	}
+
+	if hitToolRoundCap {
+		warn := "已达到工具调用轮次上限（maxAgentRounds）：本轮工具已执行，但不再继续请求模型。可在设置中提高 maxAgentRounds 或拆分任务。"
+		_ = onEvent(domain.StreamEvent{Type: domain.EventError, MessageID: msg.ID, Error: warn})
+		parts = append(parts, domain.Part{Type: domain.PartText, Text: warn})
+		_ = st.UpdateMessageParts(ctx, msg.ID, cloneParts(parts))
+		_ = onEvent(domain.StreamEvent{Type: domain.EventDone, MessageID: msg.ID})
+		_ = st.TouchSession(ctx, msg.SessionID)
+		return nil
 	}
 
 	parts = append(parts, domain.Part{Type: domain.PartText, Text: ""})
@@ -381,7 +420,7 @@ type emitEndIdxFn func(int) error
 // streamPhaseMarkdown appends one part and streams Markdown text into it (task / thinking 等).
 func streamPhaseMarkdown(
 	ctx context.Context,
-	client *llm.Client,
+	client llm.Provider,
 	cfg RunConfig,
 	system string,
 	user string,
@@ -455,7 +494,7 @@ type RunConfig struct {
 
 func reflexionAppend(
 	ctx context.Context,
-	client *llm.Client,
+	client llm.Provider,
 	cfg RunConfig,
 	work *[]llm.ChatMessage,
 	mem memory.Store,

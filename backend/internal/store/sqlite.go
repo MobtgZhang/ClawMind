@@ -11,21 +11,22 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/mobtgzhang/clawmind/backend/internal/domain"
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
-// Store persists sessions, messages, and projects (SQLite3 via mattn/go-sqlite3).
+// Store persists sessions, messages, and projects (SQLite via modernc.org/sqlite, CGO-free).
 // LLM 与界面设置见 .clawmind/config.json（clawmindcfg 包）。
 type Store struct {
 	db *sql.DB
 }
 
 func Open(path string) (*Store, error) {
-	dsn := path + "?_foreign_keys=1&_busy_timeout=5000"
-	db, err := sql.Open("sqlite3", dsn)
+	dsn := path + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
+	db.SetMaxOpenConns(1)
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
 		return nil, err
