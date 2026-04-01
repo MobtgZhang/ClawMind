@@ -13,7 +13,7 @@ help:
 	@echo ""
 	@echo "  make deps            安装前端依赖（npm ci，首次或锁文件变更后）"
 	@echo "  make frontend-install 安装前端依赖（npm install，无 lock 时可用）"
-	@echo "  make backend-build   编译后端 -> $(SERVER_BIN)（需 CGO + libsqlite3）"
+	@echo "  make backend-build   编译后端 -> $(SERVER_BIN)（纯 Go SQLite，无需 CGO）"
 	@echo "  make frontend-build  构建前端 -> frontend/dist"
 	@echo "  make build           deps + backend-build + frontend-build（发布用）"
 	@echo "  make run             本机启动：并行后端 :8080 + 前端 :5173（同 make dev）"
@@ -37,7 +37,7 @@ frontend-install:
 
 backend-build:
 	mkdir -p $(BIN_DIR)
-	cd $(BACKEND_DIR) && CGO_ENABLED=1 go build -o ../$(SERVER_BIN) ./cmd/server
+	cd $(BACKEND_DIR) && go build -o ../$(SERVER_BIN) ./cmd/server
 
 frontend-build:
 	cd $(FRONTEND_DIR) && npm run build
@@ -64,7 +64,7 @@ dev:
 	$(MAKE) -j2 dev-backend dev-frontend
 
 dev-backend:
-	cd $(BACKEND_DIR) && CGO_ENABLED=1 go run ./cmd/server
+	cd $(BACKEND_DIR) && go run ./cmd/server
 
 dev-frontend:
 	cd $(FRONTEND_DIR) && npm run dev
