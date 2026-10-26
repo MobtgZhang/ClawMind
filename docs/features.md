@@ -24,7 +24,7 @@ ClawMind 是面向开发者的 **本地优先** 代码项目 Agent：单仓库�
 - **非流式工具轮**：在流式最终回答前，可多次调用模型进行 **function calling**，执行后再继续。
 - **内置原子工具**：`file_read`、`file_write`、`shell_exec`（Windows / macOS / Linux 差异由后端处理）、`web_fetch`、`task_plan`、`task_summary`。
 
-**代码向工具**（`backend/internal/tools/code.go`）：`code_search`（有边界的字面量/正则搜索）、`repo_tree`（有界结构，跳过依赖与构建目录）、`file_edit`（精确替换，`old` 歧义即失败）、`run_tests`（跑推断出的验证命令）、`load_skill`（按需读取 harness 技能）。
+**代码向工具**（`backend/internal/tools/code.go`）：`code_search`（有边界的字面量/正则搜索）、`repo_tree`（有界结构，跳过依赖与构建目录）、`file_edit`（精确替换，`old` 歧义即失败）、`run_tests`（跑推断出的验证命令）、`load_skill`（按需读取 harness 技能）、`delegate`（在独立上下文跑一个 subagent，只回传文本）。
 
 **仓库画像**：`internal/codectx` 扫描语言、manifest、推断的 test/build/lint/format 命令与有界目录树，注入系统提示；不 shell out。
 
@@ -34,12 +34,66 @@ ClawMind 是面向开发者的 **本地优先** 代码项目 Agent：单仓库�
 - **工作目录**：`AGENT_WORKSPACE` 限制文件与 Shell 的相对路径根，降低误操作范围。
 - **高危 Shell**：匹配启发式危险模式时，经 SSE 推送确认请求，用户通过 REST 批准或拒绝后再执行（非沙箱，仍需谨慎）。
 - **web_fetch**：对目标 URL 做 SSRF 过滤，禁止访问内网与链路本地等地址。
-- **技能扩展**：侧栏 **导入** JSON（OpenAI tools 形状）或 **新建** 技能，合并写入 `.clawmind/skills.json`，并与 `TOOLS_PATH` 指向的 JSON 及内置工具合并。
+- **技能扩展**：侧栏 **导入** JSON（OpenAI tools 形状）或 **新建** 技能，合并写入 `.clawmind/skills.json`，并与 `TOOLS_PATH` 指向的 JSON、插件贡献的工具及内置工具合并。
+- **SKILL.md 导入**：`POST /api/skills/import-md` 接受 multipart 或 `{projectId, content}`，按社区 frontmatter 契约解析，写入前跑整树校验，缺触发行的技能由 `AutoTrigger()` 补齐。
 
 ### 多级记忆（L0–L3）
 
-- **L0**：当前会话消息（对话本身）。
-- **L1 / L2 / L3**：默认写入 **SQLite**（与主库同文件），会话 / 项目 / 全局分层摘要注入系统提示，**重启后保留**。若设置 `CLAWMIND_MEMORY_BACKEND=memory`，则为进程内存储，重启丢失（多用于测试）。
+记忆不是扁平记录，而是逐层蒸馏，每层回答不同的问题（参考 [TencentDB-Agent-Memory](https://github.com/TencentCloud/TencentDB-Agent-Memory)）：
+
+- **L0 conversation**：原始轮次——精确措辞、时间戳、来源。
+- **L1 atom**：事实、偏好、约束、事件——精确召回。
+- **L2 scenario**：围绕项目组织的知识块——快速恢复上下文。
+- **L3 persona**：长期画像与稳定模式——快速进入上下文。
+
+写入时只保留可泛化的流程，不保留本次任务的具体事实；L3 是合并而非追加。默认写入 **SQLite**（与主库同文件），
+**重启后保留**；`CLAWMIND_MEMORY_BACKEND=memory` 为进程内实现（多用于测试）。
+
+检索分两条路径：**bootstrap 层**（L2、L3）按新近顺序直接给出快速上下文，**fallback 层**（L0、L1）用
+BM25 + 向量 + RRF 融合召回具体事实。BM25 分词把 CJK 单字与 ASCII 词分开——中文查询没有空格，只按空白切词的
+词表永远匹配不到。融合用排名而非分数相加，因为 BM25 与余弦相似度不在同一量纲。
+
+检索在「会把记忆挤进上下文之外」的那一点上被预算约束：条目数（默认 24）、字符数（默认 2000）、超时（默认 3s）。
+嵌入失败或超时降级为 BM25，而不是返回空。每层另有条目上限（L0 400 / L1 150 / L2 100 / L3 200）：一个无上限的
+层最终会把其余上下文挤出去。
+
+### 资产登记与访问控制
+
+聊天记忆、技能、wiki 页、代码图都是**记忆资产**，用同一套登记：所有权、版本、可见性、ACL、绑定。共享是显式
+动作，不是默认泄露——`private` / `team` / `restricted` / `agent` 四种可见性，`restricted` 需要逐条 ACL。
+`draft` / `ready` / `archived` 记录异步构建状态：wiki 与代码图在 `ready` 前不可用。绑定到 agent 的资产构成
+它的 loadout，系统提示里的装载块只呈现访问控制已经判定为可见的部分。
+
+### 插件层与 seam
+
+每个部件都是一个插件：模型适配、工具注册表、会话存储、记忆存储、agent 循环、提示构造、中间件。没有可被补丁的
+特权核心——行为靠挂载插件产生，每条注册都是一个在卸载时撤销的 effect。层顺序决定谁生效；校验不通过的插件被
+跳过并报告，而不是被静默丢弃。详见 [插件层](plugins.md)。
+
+- 插件贡献的 skill 与 subagent 进入同一个可编辑面，`load_skill` 与 `delegate` 读取解析后的有效集合。
+- 插件层只能收紧安全策略：可以添加 deny / high-risk 模式，不能移除内置地板；只能降低 shell 超时与常驻文本预算；
+  工作区根只能收窄，超出进程已有根路径的请求被拒绝。
+- 声明了运行时不读取的 patch key 会被校验拒绝——一个声明了行为却从不执行的插件，正是这套设计要暴露的失败模式。嵌套值同样要能被读取：`caps` 只接受 `l0`–`l3`（大小写不敏感），写错会被报告而不是静默丢弃。
+- 侧栏 **插件层与记忆** 面板列出层顺序、解析后的配置与分层 census；`GET /api/settings` 返回文件配置加 `effective` 与 `source`，因为插件层赢的时候文件值并不生效。记忆 cap 不只是被报告，存储层裁剪时实际执行它（内存后端也一样）。
+
+### Hooks
+
+`SessionStart`、`UserPromptSubmit`、`PreToolUse`、`PostToolUse`、`PostCompact`、`Stop`、`SubagentStop`。
+退出码 `2` 是文档化的否决：调用方停止这次工具调用或本轮；其它非零退出码记录为失败但不阻塞。hook 的 stdout 作为
+指导回灌进工具结果；声明但被跳过的 hook 在 trace 里记为 `skipped`，而不是消失。`PostCompact` 只在上下文真的被
+裁剪时触发。
+
+### 委派
+
+`delegate` 工具在独立上下文里跑一个 harness subagent，只回传文本，上限 4000 字符。委派只在「输入大、回答小」
+时便宜：无上限的子代理只是把成本从工具调用挪到 transcript。
+
+### 软件工程 Skills
+
+五个优先技能（`systematic-debugging`、`test-driven-development`、`verification-before-completion`、
+`code-review`、`architecture-design`）加一条工作流链：Requirement → Architecture → Plan → TDD → Review →
+Verification → Release。核心约束是**完成声明必须带可验证的工程证据**，`scripts/preflight.py` 在报告完成前收集
+测试与 lint 证据。详见 [Skills 路线图](skills-roadmap.md)。
 
 ### 数据持久化
 

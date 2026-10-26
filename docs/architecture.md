@@ -41,13 +41,17 @@ flowchart LR
 | 路径 | 职责 |
 |------|------|
 | `cmd/server` | 入口：环境变量、`CLAWMIND_DIR`、数据库路径、路由注册 |
-| `internal/api` | HTTP 处理器：会话、消息、流、设置、项目、技能 |
+| `internal/api` | HTTP 处理器：会话、消息、流、设置、项目、技能、插件、记忆资产、harness |
 | `internal/agent` | 编排：任务/思考流式段、工具循环、最终流式回答、记忆写入 |
 | `internal/llm` | `Provider` 接口（Complete / StreamChat）；默认 `Client` 为 OpenAI 兼容 `chat/completions` |
 | `internal/clawmindcfg` | `.clawmind/config.json` 读写与解析、环境变量兜底 |
 | `internal/store` | SQLite：sessions、messages、projects |
 | `internal/tools` | 工具定义合并：内置 + 文件 + skills.json |
-| `internal/memory` | 分层内存：`Store` 接口；**默认** `SQLiteStore`（与主库同库持久化 L1–L3）；`CLAWMIND_MEMORY_BACKEND=memory` 时为进程内实现 |
+| `internal/memory` | 分层记忆：`Store` 接口；**默认** `SQLiteStore`（与主库同库持久化 L0–L3）；`CLAWMIND_MEMORY_BACKEND=memory` 时为进程内实现。`tiers.go` 定义 L0–L3，`bm25.go` + `hybrid.go` 做 BM25 + 向量 + RRF 与检索预算，`distill.go` 逐层蒸馏，`assets.go` 是资产登记（所有权、版本、可见性、ACL、绑定、loadout） |
+| `internal/plugin` | 插件层：`Registry` 按层挂载可撤销的注册；`Dispatcher` 触发 hook（退出码 2 = 否决）；`runtime.go` 解析 patch 层为运行时真正读取的值 |
+| `internal/harness` | 可编辑面：树、校验、触发行、种子面、hook 事件集合 |
+| `internal/evolution` | 自进化：Propose–Probe–Compose–Select–Reflect、证据与真实执行探针、账本（R=4k / P=3k）、runmark 与 resume、盲选与丢弃记录 |
+| `internal/security` | 安全地板：命令 deny / high-risk、路径与 SSRF 校验、`Policy`（插件层只能添加模式、只能降低上限） |
 
 ## 目录与模块（前端）
 
@@ -76,6 +80,8 @@ flowchart LR
 - **`TOOLS_PATH`**：额外工具 JSON，相对后端进程工作目录。
 - **`AGENT_WORKSPACE`**：Agent 文件与 Shell 的根路径。
 - **`CLAWMIND_MEMORY_BACKEND`**：默认 sqlite（持久化）；`memory` 为进程内（测试用）。
+- **`CLAWMIND_PLUGIN_DIR`**：插件目录，默认 `.clawmind/plugins`；按目录名顺序挂载。
+- **检索预算**：`CLAWMIND_MEMORY_MAX_ITEMS`（24）、`CLAWMIND_MEMORY_CHAR_BUDGET`（2000）、`CLAWMIND_MEMORY_TIMEOUT_MS`（3000）；分层上限 `CLAWMIND_MEMORY_L0_CAP`..`L3_CAP`。插件层只能降低这些值。
 - **`CLAWMIND_TOKEN_BUDGET`**：单次流式生成 completion token 软上限，`0` 不限制。
 - 更多变量见 [architecture-evolution.md](architecture-evolution.md) 环境变量表。
 
