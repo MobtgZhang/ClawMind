@@ -18,6 +18,8 @@ import (
 	"github.com/mobtgzhang/clawmind/backend/internal/agent"
 	"github.com/mobtgzhang/clawmind/backend/internal/clawmindcfg"
 	"github.com/mobtgzhang/clawmind/backend/internal/domain"
+	"github.com/mobtgzhang/clawmind/backend/internal/evolution"
+	"github.com/mobtgzhang/clawmind/backend/internal/harness"
 	"github.com/mobtgzhang/clawmind/backend/internal/llm"
 	"github.com/mobtgzhang/clawmind/backend/internal/mcpclient"
 	"github.com/mobtgzhang/clawmind/backend/internal/memory"
@@ -35,6 +37,8 @@ type Server struct {
 	MCP        *mcpclient.Session
 	ToolsPath  string // e.g. ./config/tools.json
 	SkillsPath string // e.g. .clawmind/skills.json
+	// Harness is the self-evolution engine; nil disables the evolution endpoints.
+	Harness *evolution.Engine
 
 	mu               sync.Mutex
 	streams          map[string]streamEntry
@@ -71,7 +75,7 @@ func NewServer(st *store.Store, cfg *clawmindcfg.Manager, client *llm.Client, me
 func (s *Server) toolDefinitions() []tools.Definition {
 	fileReg, _ := tools.Load(s.ToolsPath)
 	userReg, _ := tools.Load(s.SkillsPath)
-	out := tools.MergeDefinitions(tools.AtomicTools(), fileReg.Tools, userReg.Tools)
+	out := tools.MergeDefinitions(tools.AtomicTools(), tools.CodeTools(), fileReg.Tools, userReg.Tools)
 	if s.MCP != nil {
 		out = tools.MergeDefinitions(out, s.MCP.Definitions())
 	}
@@ -103,6 +107,7 @@ func (s *Server) Register(r *gin.Engine) {
 		api.GET("/sessions/:id/stream", s.stream)
 		api.POST("/sessions/:id/messages/:mid/cancel", s.cancelStream)
 		api.POST("/sessions/:id/tool-approval", s.postToolApproval)
+		s.harnessRoutes(api)
 	}
 }
 
@@ -501,6 +506,17 @@ func (s *Server) stream(c *gin.Context) {
 			tokBudget = n
 		}
 	}
+	pid := ""
+	if sess != nil && sess.ProjectID != nil {
+		pid = *sess.ProjectID
+	}
+	var harnessTree harness.Tree
+	var harnessLessons []domain.HarnessLesson
+	if s.Harness != nil {
+		harnessTree, _ = s.Harness.Load(pid)
+		harnessLessons, _ = s.Store.ListHarnessLessons(ctx, pid, 20)
+	}
+
 	cfg := agent.RunConfig{
 		AssistantMessageID: messageID,
 		SessionID:          sid,
@@ -517,6 +533,10 @@ func (s *Server) stream(c *gin.Context) {
 		TokenBudget:        tokBudget,
 		Workspace:          workspace,
 		ToolsJSON:          toolsJSON,
+		Repo:               s.repoProfile(workspace),
+		Harness:            harnessTree,
+		HarnessLessons:     harnessLessons,
+		AutoVerify:         envFlag("CLAWMIND_AUTO_VERIFY", true),
 	}
 	if s.MCP != nil {
 		cfg.MCPCall = s.MCP.CallTool
