@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +24,8 @@ import (
 	"github.com/mobtgzhang/clawmind/backend/internal/llm"
 	"github.com/mobtgzhang/clawmind/backend/internal/mcpclient"
 	"github.com/mobtgzhang/clawmind/backend/internal/memory"
+	"github.com/mobtgzhang/clawmind/backend/internal/plugin"
+	"github.com/mobtgzhang/clawmind/backend/internal/security"
 	"github.com/mobtgzhang/clawmind/backend/internal/store"
 	"github.com/mobtgzhang/clawmind/backend/internal/thread"
 	"github.com/mobtgzhang/clawmind/backend/internal/tools"
@@ -37,8 +40,27 @@ type Server struct {
 	MCP        *mcpclient.Session
 	ToolsPath  string // e.g. ./config/tools.json
 	SkillsPath string // e.g. .clawmind/skills.json
+	// HarnessRoot is the per-scope harness directory, so the editable surface exists even when the
+	// evolution engine is off.
+	HarnessRoot string
 	// Harness is the self-evolution engine; nil disables the evolution endpoints.
 	Harness *evolution.Engine
+	// Plugins is the composed plugin set. nil disables the plugin endpoints.
+	Plugins *plugin.Registry
+	// Dispatcher fires plugin hooks for the agent loop.
+	Dispatcher *plugin.Dispatcher
+	// Assets is the memory asset registry (ownership, version, visibility, ACL, bindings).
+	Assets *memory.AssetRegistry
+	// Pipeline distils memory layers off the turn: L0 raw -> L1 atom -> L2 scenario -> L3 persona.
+	Pipeline *memory.Pipeline
+	// Ret applies the retrieval budget: item count, character budget, and timeout.
+	Ret *memory.Retriever
+	// Runtime is the patch layers resolved at boot. Only keys the host reads are represented, so a
+	// seam that is declared but never consumed cannot look like a feature.
+	Runtime plugin.Runtime
+	// Cap is the per-layer memory limit the runtime actually enforces, after the memory layer has
+	// lowered it.
+	Cap memory.LayerCap
 
 	mu               sync.Mutex
 	streams          map[string]streamEntry
@@ -72,12 +94,37 @@ func NewServer(st *store.Store, cfg *clawmindcfg.Manager, client *llm.Client, me
 	}
 }
 
+// layerCap returns the per-layer limits the runtime actually enforces. The census compares counts
+// against these caps, so reporting the defaults when a memory layer lowered a cap would hide the one
+// layer that is already pushing the rest of the context out.
+func (s *Server) layerCap() memory.LayerCap {
+	c := s.Cap
+	if c.L0 == 0 && c.L1 == 0 && c.L2 == 0 && c.L3 == 0 {
+		return memory.DefaultLayerCap()
+	}
+	return c
+}
+
 func (s *Server) toolDefinitions() []tools.Definition {
-	fileReg, _ := tools.Load(s.ToolsPath)
-	userReg, _ := tools.Load(s.SkillsPath)
+	toolsPath, skillsPath := s.ToolsPath, s.SkillsPath
+	if s.Runtime.Tools.ToolsPath != "" {
+		toolsPath = s.Runtime.Tools.ToolsPath
+	}
+	if s.Runtime.Tools.SkillsPath != "" {
+		skillsPath = s.Runtime.Tools.SkillsPath
+	}
+	fileReg, _ := tools.Load(toolsPath)
+	userReg, _ := tools.Load(skillsPath)
 	out := tools.MergeDefinitions(tools.AtomicTools(), tools.CodeTools(), fileReg.Tools, userReg.Tools)
 	if s.MCP != nil {
 		out = tools.MergeDefinitions(out, s.MCP.Definitions())
+	}
+	// A mounted plugin replaces the whole definition of a tool it registers, which is what makes
+	// the tool seam replaceable from config rather than hardcoded.
+	if s.Plugins != nil {
+		for _, src := range s.Plugins.Tools() {
+			out = tools.MergeDefinitions(out, []tools.Definition{src.Definition})
+		}
 	}
 	return out
 }
@@ -91,6 +138,7 @@ func (s *Server) Register(r *gin.Engine) {
 		api.GET("/skills", s.listSkills)
 		api.POST("/skills", s.createSkill)
 		api.POST("/skills/import", s.importSkills)
+		api.POST("/skills/import-md", s.importSkillMarkdown)
 		api.POST("/projects", s.createProject)
 		api.GET("/projects", s.listProjects)
 		api.DELETE("/projects/:id", s.deleteProject)
@@ -107,8 +155,103 @@ func (s *Server) Register(r *gin.Engine) {
 		api.GET("/sessions/:id/stream", s.stream)
 		api.POST("/sessions/:id/messages/:mid/cancel", s.cancelStream)
 		api.POST("/sessions/:id/tool-approval", s.postToolApproval)
+		s.pluginRoutes(api)
+		s.memoryRoutes(api)
 		s.harnessRoutes(api)
 	}
+}
+
+// pluginRoutes registers the plugin surface. Every part of the product is a plugin, so the routes
+// expose the resolved composition rather than a static list of features.
+func (s *Server) pluginRoutes(g *gin.RouterGroup) {
+	if s.Plugins == nil {
+		return
+	}
+	g.GET("/plugins", s.listPlugins)
+	g.POST("/plugins", s.installPlugin)
+	g.POST("/plugins/:id/enable", s.enablePlugin)
+	g.POST("/plugins/:id/disable", s.disablePlugin)
+	g.GET("/plugins/config", s.getPluginConfig)
+}
+
+// memoryRoutes registers the layered memory and the asset registry.
+func (s *Server) memoryRoutes(g *gin.RouterGroup) {
+	g.GET("/memory/layers", s.listMemoryLayers)
+	g.GET("/memory/search", s.searchMemory)
+	if s.Pipeline != nil {
+		g.POST("/memory/distill", s.distillMemory)
+	}
+	if s.Assets == nil {
+		return
+	}
+	g.GET("/memory/assets", s.listAssets)
+	g.POST("/memory/assets", s.registerAsset)
+	g.GET("/memory/assets/:id", s.getAsset)
+	g.POST("/memory/assets/:id/share", s.shareAsset)
+	g.POST("/memory/assets/:id/status", s.setAssetStatus)
+	g.POST("/memory/assets/:id/acl", s.addAssetACL)
+	g.POST("/memory/assets/:id/acl/revoke", s.revokeAssetACL)
+	g.POST("/memory/assets/:id/bind", s.bindAsset)
+	g.POST("/memory/unbind/:bindingId", s.unbindAsset)
+	g.GET("/memory/loadout", s.getLoadout)
+}
+
+// applyRuntimeLayer puts the resolved patch layers on top of the file and environment config. The
+// layer is operator config, so it wins over the file; a per-session model still wins over the layer
+// because that is the user's choice for this conversation.
+func (s *Server) applyRuntimeLayer(base clawmindcfg.Resolved) clawmindcfg.Resolved {
+	out := base
+	rt := s.Runtime
+	if rt.LLM.Model != "" {
+		out.Model = rt.LLM.Model
+	}
+	if rt.LLM.BaseURL != "" {
+		out.BaseURL = rt.LLM.BaseURL
+	}
+	if rt.LLM.APIKey != "" {
+		out.APIKey = rt.LLM.APIKey
+	}
+	if rt.LLM.Temperature != nil {
+		out.Temperature = *rt.LLM.Temperature
+	}
+	if rt.LLM.TopP != nil {
+		out.TopP = *rt.LLM.TopP
+	}
+	if rt.LLM.TopK != nil {
+		out.TopK = rt.LLM.TopK
+	}
+	if rt.LLM.MaxAgentRounds > 0 {
+		out.MaxAgentRounds = rt.LLM.MaxAgentRounds
+	}
+	if rt.Prompt.SystemPrompt != "" {
+		out.SystemPrompt = rt.Prompt.SystemPrompt
+	}
+	return out
+}
+
+// narrowWorkspace applies the sandbox layer to the workspace root. A plugin may narrow the root but
+// never widen it: a layer that could escape the root the process was given would make the root
+// meaningless, so a widening request is refused rather than trusted.
+func narrowWorkspace(base, want string) (string, bool) {
+	want = strings.TrimSpace(want)
+	if want == "" {
+		return base, false
+	}
+	absBase, err := filepath.Abs(filepath.Clean(base))
+	if err != nil {
+		return base, false
+	}
+	abs, err := filepath.Abs(filepath.Clean(want))
+	if err != nil {
+		return base, false
+	}
+	if abs == absBase {
+		return abs, true
+	}
+	if !strings.HasPrefix(abs, absBase+string(os.PathSeparator)) {
+		return base, false
+	}
+	return abs, true
 }
 
 func (s *Server) health(c *gin.Context) {
@@ -480,7 +623,7 @@ func (s *Server) stream(c *gin.Context) {
 		_ = send(domain.StreamEvent{Type: domain.EventError, MessageID: messageID, Error: err.Error()})
 		return
 	}
-	resolved := fileCfg.Resolved()
+	resolved := s.applyRuntimeLayer(fileCfg.Resolved())
 	sess, _ := s.Store.GetSession(ctx, sid)
 	model := resolved.Model
 	if sess != nil && sess.Model != "" {
@@ -492,19 +635,33 @@ func (s *Server) stream(c *gin.Context) {
 			workspace = wd
 		}
 	}
+	// The sandbox layer may narrow the root, never widen it, so a plugin cannot reach outside the
+	// workspace the process was given.
+	if narrowed, applied := narrowWorkspace(workspace, s.Runtime.Sandbox.Workspace); applied {
+		workspace = narrowed
+	}
 	toolsJSON, _ := json.Marshal(s.toolDefinitions())
 	promptsDir := strings.TrimSpace(os.Getenv("AGENT_PROMPTS_DIR"))
+	if s.Runtime.Prompt.PromptsDir != "" {
+		promptsDir = s.Runtime.Prompt.PromptsDir
+	}
 	maxCtx := 24000
 	if v := strings.TrimSpace(os.Getenv("CLAWMIND_MAX_CONTEXT_TOKENS")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			maxCtx = n
 		}
 	}
+	if s.Runtime.Session.MaxContextTokens > 0 {
+		maxCtx = s.Runtime.Session.MaxContextTokens
+	}
 	tokBudget := 0
 	if v := strings.TrimSpace(os.Getenv("CLAWMIND_TOKEN_BUDGET")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			tokBudget = n
 		}
+	}
+	if s.Runtime.Session.TokenBudget > 0 {
+		tokBudget = s.Runtime.Session.TokenBudget
 	}
 	pid := ""
 	if sess != nil && sess.ProjectID != nil {
@@ -515,6 +672,23 @@ func (s *Server) stream(c *gin.Context) {
 	if s.Harness != nil {
 		harnessTree, _ = s.Harness.Load(pid)
 		harnessLessons, _ = s.Store.ListHarnessLessons(ctx, pid, 20)
+	}
+	// Plugin contributions are materialised into the view the agent sees, so a skill or subagent
+	// mounted by a plugin is reachable through load_skill and delegate on the same surface.
+	if s.Plugins != nil && len(harnessTree) > 0 {
+		harnessTree = harnessTree.WithContributions(s.Plugins.Skills(), s.Plugins.Subagents())
+	}
+	var loadout []memory.Asset
+	if s.Assets != nil {
+		loadout, _ = s.Assets.Loadout(ctx, memory.Viewer{AgentID: "clawmind", Role: "member"})
+	}
+
+	// The sandbox layer is only attached when it actually says something: an empty layer means the
+	// built-in floor, not a policy the agent has to reason about.
+	var shellPolicy *security.Policy
+	if rt := s.Runtime.Sandbox; len(rt.Denied) > 0 || len(rt.HighRisk) > 0 || rt.ShellTimeout > 0 || rt.Workspace != "" || rt.AllowApproval {
+		resolvedPolicy := rt.Policy()
+		shellPolicy = &resolvedPolicy
 	}
 
 	cfg := agent.RunConfig{
@@ -537,9 +711,18 @@ func (s *Server) stream(c *gin.Context) {
 		Harness:            harnessTree,
 		HarnessLessons:     harnessLessons,
 		AutoVerify:         envFlag("CLAWMIND_AUTO_VERIFY", true),
+		ProjectID:          pid,
+		ShellPolicy:        shellPolicy,
+		Loadout:            loadout,
 	}
 	if s.MCP != nil {
 		cfg.MCPCall = s.MCP.CallTool
+	}
+	if s.Dispatcher != nil {
+		cfg.Hooks = s.Dispatcher
+	}
+	if s.Pipeline != nil {
+		cfg.Observer = s.Pipeline
 	}
 	cfg.WaitShellApproval = func(ctx context.Context, req agent.ShellApprovalRequest) (bool, error) {
 		id := uuid.NewString()

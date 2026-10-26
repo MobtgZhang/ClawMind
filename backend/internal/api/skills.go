@@ -3,12 +3,15 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/mobtgzhang/clawmind/backend/internal/harness"
+	"github.com/mobtgzhang/clawmind/backend/internal/plugin"
 	"github.com/mobtgzhang/clawmind/backend/internal/tools"
 )
 
@@ -141,4 +144,74 @@ func (s *Server) saveSkillsFile(reg *tools.Registry) error {
 		return err
 	}
 	return os.Rename(tmp, s.SkillsPath)
+}
+
+// importSkillMarkdown imports one SKILL.md onto the editable surface for a scope. A skill that is
+// never named in always-on text is never opened, so the import also writes its trigger line. An
+// import that cannot validate is rejected in full rather than applied partially.
+func (s *Server) importSkillMarkdown(c *gin.Context) {
+	var projectID, content string
+	if fh, err := c.FormFile("file"); err == nil {
+		src, err := fh.Open()
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		defer src.Close()
+		b, err := io.ReadAll(src)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		content = string(b)
+		projectID = strings.TrimSpace(c.Query("projectId"))
+	} else {
+		var req struct {
+			ProjectID string `json:"projectId"`
+			Content   string `json:"content"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "file or {projectId, content} is required"})
+			return
+		}
+		content = req.Content
+		projectID = strings.TrimSpace(req.ProjectID)
+	}
+	if strings.TrimSpace(content) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "SKILL.md content is empty"})
+		return
+	}
+	comp, err := plugin.ParseComponent(content, "SKILL.md")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	dir := s.harnessDir(projectID)
+	tree, err := harness.Read(dir)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	rel := harness.SkillDir + "/" + comp.Name + "/SKILL.md"
+	tree[rel] = "---\nname: " + comp.Name + "\ndescription: " + comp.Description + "\n---\n" + comp.Body + "\n"
+
+	fixed := tree.AutoTrigger()
+	if problems := tree.Validate(); len(problems) > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":    "imported skill is invalid: " + strings.Join(problems, "; "),
+			"problems": problems,
+			"hint":     "a skill must be named in always-on text by a trigger line; AutoTrigger added " + strings.Join(fixed, ", "),
+		})
+		return
+	}
+	if err := tree.Write(dir); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{
+		"ok": true, "dir": dir, "path": rel, "name": comp.Name,
+		"description": comp.Description, "triggerAdded": fixed,
+		"alwaysOnChars": tree.AlwaysOnChars(),
+	})
 }

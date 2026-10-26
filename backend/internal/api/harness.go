@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -15,14 +16,17 @@ import (
 	"github.com/mobtgzhang/clawmind/backend/internal/store"
 )
 
-// harnessRoutes registers the self-evolution endpoints.
+// harnessRoutes registers the self-evolution endpoints. The editable surface is registered
+// unconditionally: the harness directory exists even when the evolution engine is off, so a skill or
+// trigger line can still be read and edited. Only the round-based endpoints need an engine.
 func (s *Server) harnessRoutes(g *gin.RouterGroup) {
-	if s.Harness == nil {
-		return
-	}
+	g.POST("/harness/seed", s.seedHarness)
 	g.GET("/harness", s.getHarness)
 	g.GET("/harness/file", s.getHarnessFile)
 	g.POST("/harness/file", s.putHarnessFile)
+	if s.Harness == nil {
+		return
+	}
 	g.POST("/harness/round", s.runHarnessRound)
 	g.GET("/harness/rounds", s.listHarnessRounds)
 	g.POST("/harness/adopt", s.adoptHarness)
@@ -44,19 +48,31 @@ type harnessView struct {
 	Entries       []evolution.Entry      `json:"entries"`
 }
 
+// loadHarness reads one scope. Without an engine the directory is still the source of truth, so the
+// surface stays readable and editable; the engine only adds rounds and entries on top of it.
+func (s *Server) loadHarness(projectID string) (harness.Tree, error) {
+	if s.Harness != nil {
+		return s.Harness.Load(projectID)
+	}
+	return harness.Read(s.harnessDir(projectID))
+}
+
 func (s *Server) getHarness(c *gin.Context) {
 	ctx := c.Request.Context()
 	projectID := strings.TrimSpace(c.Query("projectId"))
-	t, err := s.Harness.Load(projectID)
+	t, err := s.loadHarness(projectID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	lessons, _ := s.Store.ListHarnessLessons(ctx, projectID, 40)
-	entries, _ := s.Harness.ListEntries(projectID)
+	var entries []evolution.Entry
+	if s.Harness != nil {
+		entries, _ = s.Harness.ListEntries(projectID)
+	}
 	c.JSON(http.StatusOK, harnessView{
 		ProjectID:     projectID,
-		Dir:           s.Harness.Dir(projectID),
+		Dir:           s.harnessDir(projectID),
 		Files:         t,
 		AlwaysOn:      t.AlwaysOnPaths(),
 		AlwaysOnChars: t.AlwaysOnChars(),
@@ -74,7 +90,7 @@ func (s *Server) getHarnessFile(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "path is not on the editable harness surface"})
 		return
 	}
-	t, err := s.Harness.Load(strings.TrimSpace(c.Query("projectId")))
+	t, err := s.loadHarness(strings.TrimSpace(c.Query("projectId")))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -101,7 +117,7 @@ func (s *Server) putHarnessFile(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "path is not on the editable harness surface"})
 		return
 	}
-	t, err := s.Harness.Load(req.ProjectID)
+	t, err := s.loadHarness(req.ProjectID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -111,7 +127,7 @@ func (s *Server) putHarnessFile(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": strings.Join(problems, "; ")})
 		return
 	}
-	if err := t.Write(s.Harness.Dir(req.ProjectID)); err != nil {
+	if err := t.Write(s.harnessDir(req.ProjectID)); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -225,6 +241,58 @@ func (s *Server) getHarnessLibrary(c *gin.Context) {
 
 func normalizeHarnessPath(rel string) string {
 	return strings.TrimSpace(strings.ReplaceAll(rel, "\\", "/"))
+}
+
+// harnessDir is the on-disk harness for one scope. The surface exists even when the evolution
+// engine is off, so seeding and importing do not depend on a model being configured.
+func (s *Server) harnessDir(projectID string) string {
+	scope := strings.TrimSpace(projectID)
+	if scope == "" {
+		scope = "global"
+	}
+	root := strings.TrimSpace(s.HarnessRoot)
+	if root == "" {
+		root = ".clawmind/harness"
+	}
+	return filepath.Join(root, scope)
+}
+
+// seedHarness fills the gaps in one scope with the software-engineering surface. It never
+// overwrites: a harness that already works is not replaced by a template.
+func (s *Server) seedHarness(c *gin.Context) {
+	var req struct {
+		ProjectID string `json:"projectId"`
+	}
+	_ = c.ShouldBindJSON(&req)
+	dir := s.harnessDir(req.ProjectID)
+	t, err := harness.Read(dir)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	seed := harness.SeedTree()
+	var added []string
+	for rel, content := range seed {
+		if _, ok := t[rel]; ok {
+			continue
+		}
+		t[rel] = content
+		added = append(added, rel)
+	}
+	if len(added) == 0 {
+		c.JSON(http.StatusOK, gin.H{"ok": true, "dir": dir, "added": []string{}, "skills": t.Skills()})
+		return
+	}
+	if problems := t.Validate(); len(problems) > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "seeded harness is invalid: " + strings.Join(problems, "; "), "problems": problems})
+		return
+	}
+	sort.Strings(added)
+	if err := t.Write(dir); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{"ok": true, "dir": dir, "added": added, "skills": t.Skills()})
 }
 
 // repoProfile profiles the workspace for code tasks: languages, manifests and the inferred
