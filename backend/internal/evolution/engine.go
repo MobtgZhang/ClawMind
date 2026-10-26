@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"math/rand"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -31,14 +30,27 @@ type Config struct {
 	Model            string
 	MaxAlwaysOnChars int
 	MaxEvidenceChars int
+	// Workdir and TestCommand drive the executing probe. Without ProbeExec the engine can only
+	// predict, and every probe is labelled as a prediction.
+	ProbeExec   bool
+	Workdir     string
+	TestCommand string
+	// Resume reuses a finished run with the same task + harness + mode + k instead of repeating it.
+	Resume bool
+	// EnforceLedger turns the budget identity into a recorded error when a round does not land on it.
+	EnforceLedger bool
+	// SeedSkills starts an empty scope from the software-engineering surface. Seeding writes a
+	// trigger line for every skill, so any later rewrite of always-on text must restate them.
+	SeedSkills bool
 }
 
 // Engine runs task-level recursion (Propose-Probe-Compose-Reflect) and keeps the
 // harnessing-level recursion (the per-project experience library).
 type Engine struct {
-	store *store.Store
-	llm   Caller
-	cfg   Config
+	store       *store.Store
+	llm         Caller
+	cfg         Config
+	probeRunner ProbeRunner
 }
 
 func New(st *store.Store, caller Caller, cfg Config) *Engine {
@@ -57,7 +69,17 @@ func New(st *store.Store, caller Caller, cfg Config) *Engine {
 	if cfg.MaxAlwaysOnChars <= 0 {
 		cfg.MaxAlwaysOnChars = 4000
 	}
+	if !cfg.Resume {
+		cfg.Resume = true
+	}
 	return &Engine{store: st, llm: caller, cfg: cfg}
+}
+
+// SetProbeRunner installs the executor that turns a candidate into measured evidence.
+func (e *Engine) SetProbeRunner(r ProbeRunner) {
+	if r != nil {
+		e.probeRunner = r
+	}
 }
 
 // Candidate is one proposed harness variant on one dimension.
@@ -67,17 +89,35 @@ type Candidate struct {
 	Tree     harness.Tree `json:"tree"`
 	Notes    string       `json:"notes,omitempty"`
 	KeptBase bool         `json:"keptBase"`
-	Probe    Probe        `json:"probe"`
+	// Base is the harness this candidate was proposed against. Without it a change cannot be
+	// attributed to a single component, so confounding cannot be detected.
+	Base  harness.Tree `json:"-"`
+	Probe Probe        `json:"probe"`
+}
+
+// Probe is one candidate's measured or predicted effect on the recorded trajectory.
+type Probe struct {
+	Label      string `json:"label"`
+	Score      int    `json:"score"`
+	Observed   string `json:"observed,omitempty"`
+	Confounded bool   `json:"confounded"`
+	Executed   bool   `json:"executed"`
+	TestPassed bool   `json:"testPassed"`
+	Graded     bool   `json:"graded"`
+	Predicted  bool   `json:"predicted"`
 }
 
 // Result is one completed round.
 type Result struct {
 	Round      *domain.HarnessRound  `json:"round"`
 	Candidates []Candidate           `json:"candidates"`
+	Finals     []Candidate           `json:"finals"`
 	Edits      []domain.HarnessEdit  `json:"edits"`
 	Lesson     *domain.HarnessLesson `json:"lesson,omitempty"`
 	Final      harness.Tree          `json:"final"`
 	Chosen     string                `json:"chosen"`
+	Ledger     *Ledger               `json:"ledger"`
+	Selection  *Selection            `json:"selection"`
 }
 
 // Dir is the on-disk harness for a scope (project id, or "global" when empty).
@@ -96,79 +136,160 @@ func (e *Engine) Load(projectID string) (harness.Tree, error) {
 		return nil, err
 	}
 	if len(t) == 0 {
-		t = defaultHarness()
+		if e.cfg.SeedSkills {
+			t = harness.SeedTree()
+		} else {
+			t = defaultHarness()
+		}
 	}
 	return t, nil
 }
 
+// Seed writes the software-engineering surface for a scope and returns what was added. An existing
+// harness is not overwritten: seeding fills gaps, it does not replace a harness that already works.
+func (e *Engine) Seed(projectID string) (harness.Tree, []string, error) {
+	dir := e.Dir(projectID)
+	t, err := harness.Read(dir)
+	if err != nil {
+		return nil, nil, err
+	}
+	seed := harness.SeedTree()
+	var added []string
+	for rel, content := range seed {
+		if _, ok := t[rel]; ok {
+			continue
+		}
+		t[rel] = content
+		added = append(added, rel)
+	}
+	if len(added) == 0 {
+		return t, nil, nil
+	}
+	if problems := t.Validate(); len(problems) > 0 {
+		return t, added, fmt.Errorf("seeded harness is invalid: %s", strings.Join(problems, "; "))
+	}
+	sort.Strings(added)
+	if err := t.Write(dir); err != nil {
+		return t, added, err
+	}
+	return t, added, nil
+}
+
 // RunRound performs one Propose-Probe-Compose-Reflect step for a recorded task trajectory.
+//
+// The shape is fixed: k branches, each with one INV and one DOM proposal, each proposal probed,
+// each branch composed into a final. Selection then chooses among the k finals, and reflection
+// records what the chosen final actually did.
 func (e *Engine) RunRound(ctx context.Context, projectID, sessionID, evidence string) (*Result, error) {
 	base, err := e.Load(projectID)
 	if err != nil {
 		return nil, err
 	}
 	evidence = bound(evidence, e.cfg.MaxEvidenceChars)
+	taskID := TaskKey(evidence)
+
 	res := &Result{Round: &domain.HarnessRound{
 		ID: uuid.NewString(), ProjectID: projectID, SessionID: sessionID,
-		Mode: e.cfg.Mode, K: e.cfg.K,
+		Mode: e.cfg.Mode, K: e.cfg.K, TaskID: taskID,
 	}}
+	res.Ledger = NewLedger(e.cfg.Mode, taskID, e.cfg.K)
+	res.Selection = NewSelection(taskID, e.cfg.Mode, e.cfg.K)
 	var errors []string
 
-	checkpoint := base
-	rounds := 1
-	if e.cfg.Mode == "sequential" {
-		rounds = e.cfg.K
+	// A run that already finished for this exact configuration is reused, not repeated. Presence
+	// of output is not completion: only a recorded marker naming the same harness counts.
+	if e.store != nil && e.cfg.Resume {
+		mark, err := e.store.LookupRunmark(ctx, taskID, Fingerprint(base), e.cfg.Mode, e.cfg.K)
+		if err != nil {
+			errors = append(errors, "runmark: "+err.Error())
+		}
+		if mark != nil && mark.Completed {
+			res.Round.Runmark = mark.ID
+			res.Round.Cached = true
+			res.Round.Adopted = mark.Chosen
+			res.Final = base
+			res.Round.Inventory = base.Inventory()
+			res.Round.AlwaysOn = base.AlwaysOnChars()
+			res.Round.KeptBase = true
+			res.Round.Errors = errors
+			res.Ledger.Session("resume", true, 1)
+			res.Round.LedgerR, res.Round.LedgerP, res.Round.MeasuredR = res.Ledger.R(), res.Ledger.P(), res.Ledger.MeasuredR()
+			return res, nil
+		}
 	}
-	for t := 1; t <= rounds; t++ {
-		cands, err := e.propose(ctx, checkpoint, evidence, t)
+
+	// k shared base rollouts: every branch starts from the same measured base.
+	for i := 1; i <= e.cfg.K; i++ {
+		res.Ledger.Rollout(fmt.Sprintf("base%d", i), false, false)
+	}
+
+	checkpoint := base
+	for t := 1; t <= e.cfg.K; t++ {
+		final, err := e.branch(ctx, checkpoint, evidence, t, res, &errors)
 		if err != nil {
-			errors = append(errors, fmt.Sprintf("round %d: %v", t, err))
+			errors = append(errors, fmt.Sprintf("branch %d: %v", t, err))
 			continue
 		}
-		res.Candidates = append(res.Candidates, cands...)
-		if len(cands) == 0 {
-			continue
+		if final != nil {
+			res.Finals = append(res.Finals, *final)
+			if e.cfg.Mode == "sequential" {
+				// Sequential mode carries the chosen branch forward; parallel branches stay independent.
+				checkpoint = final.Tree
+			}
 		}
-		if err := e.probe(ctx, cands, evidence); err != nil {
-			errors = append(errors, fmt.Sprintf("probe round %d: %v", t, err))
-		}
-		chosen, err := e.selectCandidate(ctx, cands)
+	}
+
+	pool := res.Selection.BuildPool(SelectionPool(e.cfg.Mode, e.cfg.K, res.Finals))
+	if len(pool) > 0 {
+		chosen, err := e.selectCandidate(ctx, pool, res)
 		if err != nil {
-			errors = append(errors, fmt.Sprintf("select round %d: %v", t, err))
+			errors = append(errors, "select: "+err.Error())
+			res.Selection.Fallback = true
+			chosen = bestByEvidence(pool)
+			if chosen != nil {
+				res.Selection.ChosenLabel = chosen.Label
+			}
 		}
 		if chosen != nil {
 			res.Chosen = chosen.Label
-			checkpoint = chosen.Tree
+			res.Final = chosen.Tree
 		}
 	}
 
-	final, err := e.compose(ctx, base, res.Candidates, evidence)
-	if err != nil {
-		errors = append(errors, "compose: "+err.Error())
-		final = base
+	if res.Final == nil || len(res.Final) == 0 {
+		res.Final = copyTree(base)
 	}
-	if problems := final.Validate(); len(problems) > 0 {
+	if problems := res.Final.Validate(); len(problems) > 0 {
 		// A proposal that fails validation is discarded entire, not partially applied.
 		errors = append(errors, "validation: "+strings.Join(problems, "; "))
-		final = base
+		res.Final = copyTree(base)
 	}
-	if final.AlwaysOnChars() > e.cfg.MaxAlwaysOnChars {
-		errors = append(errors, fmt.Sprintf("always-on text %d chars exceeds budget %d", final.AlwaysOnChars(), e.cfg.MaxAlwaysOnChars))
+	if res.Final.AlwaysOnChars() > e.cfg.MaxAlwaysOnChars {
+		errors = append(errors, fmt.Sprintf("always-on text %d chars exceeds budget %d", res.Final.AlwaysOnChars(), e.cfg.MaxAlwaysOnChars))
 	}
 
-	edits, lesson, err := e.reflect(ctx, base, final, res.Candidates, evidence)
+	edits, lesson, err := e.reflect(ctx, base, res.Final, res.Candidates, res.Finals, evidence)
 	if err != nil {
 		errors = append(errors, "reflect: "+err.Error())
 	}
 	res.Edits = edits
 	res.Lesson = lesson
-	res.Final = final
 	res.Round.Errors = errors
 	res.Round.Adopted = res.Chosen
 	res.Round.Notes = composeNotes(res.Candidates)
-	res.Round.Inventory = final.Inventory()
-	res.Round.AlwaysOn = final.AlwaysOnChars()
-	res.Round.KeptBase = harness.Diff(base, final).Empty()
+	res.Round.Inventory = res.Final.Inventory()
+	res.Round.AlwaysOn = res.Final.AlwaysOnChars()
+	res.Round.KeptBase = harness.Diff(base, res.Final).Empty()
+	res.Round.Pool = labels(res.Selection.Pool())
+	res.Round.Dropped = res.Selection.Dropped
+	res.Round.LedgerR, res.Round.LedgerP, res.Round.MeasuredR = res.Ledger.R(), res.Ledger.P(), res.Ledger.MeasuredR()
+
+	if e.cfg.EnforceLedger && e.cfg.Mode != "dry" {
+		if err := res.Ledger.Check(); err != nil {
+			errors = append(errors, "ledger: "+err.Error())
+			res.Round.Errors = errors
+		}
+	}
 
 	if err := e.persist(ctx, res); err != nil {
 		return res, err
@@ -176,99 +297,149 @@ func (e *Engine) RunRound(ctx context.Context, projectID, sessionID, evidence st
 	return res, nil
 }
 
-func (e *Engine) propose(ctx context.Context, base harness.Tree, evidence string, round int) ([]Candidate, error) {
-	if e.cfg.Mode == "dry" || e.llm == nil {
-		return dryCandidates(base, round), nil
-	}
-	var out []Candidate
+// branch runs one Propose (INV + DOM) - Probe - Compose step and returns the final it produced.
+func (e *Engine) branch(ctx context.Context, base harness.Tree, evidence string, t int, res *Result, errors *[]string) (*Candidate, error) {
+	var cands []Candidate
 	for _, dim := range []string{"INV", "DOM"} {
-		for i := 1; i <= e.cfg.K; i++ {
-			mission := ProposePrompt(dim, e.cfg.K, i, evidence)
-			reply, err := e.call(ctx, mission, "当前 harness：\n"+renderTree(base)+"\n\n执行轨迹：\n"+evidence)
-			if err != nil {
-				return out, fmt.Errorf("propose %s#%d: %w", dim, i, err)
-			}
-			p := ParseProposal(reply, base)
-			label := fmt.Sprintf("r%d-%s-%d", round, dim, i)
-			if problems := p.Tree.Validate(); len(problems) > 0 {
-				// One retry, then inherit the current harness.
-				retry, rerr := e.call(ctx, mission+"\n\n上一次提案因以下规则被丢弃：\n"+strings.Join(problems, "\n"),
-					"当前 harness：\n"+renderTree(base)+"\n\n执行轨迹：\n"+evidence)
-				if rerr != nil {
-					return out, fmt.Errorf("propose %s#%d retry: %w", dim, i, rerr)
-				}
-				p = ParseProposal(retry, base)
-				if problems = p.Tree.Validate(); len(problems) > 0 {
-					return out, fmt.Errorf("propose %s#%d invalid after retry: %s", dim, i, strings.Join(problems, "; "))
-				}
-			}
-			out = append(out, Candidate{
-				Label: label, Dim: dim, Tree: p.Tree, Notes: p.Notes, KeptBase: p.KeptBase(),
-			})
+		label := fmt.Sprintf("%s%d", dim, t)
+		if e.cfg.Mode == "dry" || e.llm == nil {
+			c := dryCandidate(base, label, dim)
+			res.Candidates = append(res.Candidates, c)
+			cands = append(cands, c)
+			continue
 		}
-	}
-	return out, nil
-}
-
-func (e *Engine) probe(ctx context.Context, cands []Candidate, evidence string) error {
-	if e.cfg.Mode == "dry" || e.llm == nil {
-		for i := range cands {
-			cands[i].Probe = Probe{Label: cands[i].Label, Score: 0, Observed: "dry run: no execution", Confounded: true}
-		}
-		return nil
-	}
-	for i := range cands {
-		mission := ProbePrompt(cands[i].Label, evidence)
-		reply, err := e.call(ctx, mission, "候选 harness：\n"+renderTree(cands[i].Tree))
+		mission := ProposePrompt(dim, e.cfg.K, t, evidence)
+		user := "当前 harness：\n" + renderTree(base) + "\n\n执行轨迹：\n" + evidence
+		reply, err := e.call(ctx, mission, user)
+		attempts := 1
 		if err != nil {
-			return err
+			*errors = append(*errors, fmt.Sprintf("propose %s: %v", label, err))
+			continue
 		}
-		cands[i].Probe = parseProbe(reply, cands[i].Label)
+		p := ParseProposal(reply, base)
+		if problems := p.Tree.Validate(); len(problems) > 0 {
+			// One retry, then the proposal is dropped entire rather than applied partially.
+			attempts = 2
+			retry, rerr := e.call(ctx, mission+"\n\n上一次提案因以下规则被丢弃：\n"+strings.Join(problems, "\n"), user)
+			if rerr != nil {
+				*errors = append(*errors, fmt.Sprintf("propose %s retry: %v", label, rerr))
+				continue
+			}
+			p = ParseProposal(retry, base)
+			if problems = p.Tree.Validate(); len(problems) > 0 {
+				*errors = append(*errors, fmt.Sprintf("propose %s invalid after retry: %s", label, strings.Join(problems, "; ")))
+				continue
+			}
+		}
+		res.Ledger.Session(label, false, attempts)
+		c := Candidate{Label: label, Dim: dim, Tree: p.Tree, Notes: p.Notes, KeptBase: p.KeptBase(), Base: base}
+		res.Candidates = append(res.Candidates, c)
+		cands = append(cands, c)
 	}
-	return nil
-}
 
-// selectCandidate performs blind selection over anonymized ids: an id carries no information
-// about which candidate produced what.
-func (e *Engine) selectCandidate(ctx context.Context, cands []Candidate) (*Candidate, error) {
+	for i := range cands {
+		e.probeOne(ctx, &cands[i], evidence, res)
+	}
+
+	finalLabel := fmt.Sprintf("agg%d", t)
+	if e.cfg.Mode != "parallel" {
+		finalLabel = fmt.Sprintf("c%d", t)
+	}
 	if len(cands) == 0 {
 		return nil, nil
 	}
-	if e.cfg.Mode == "dry" || e.llm == nil {
-		best := cands[0]
-		for _, c := range cands {
-			if c.Probe.Score > best.Probe.Score {
-				best = c
-			}
-		}
-		return &best, nil
+	res.Ledger.Session(finalLabel, false, 1)
+	final, err := e.compose(ctx, base, cands, evidence)
+	if err != nil {
+		*errors = append(*errors, fmt.Sprintf("compose %s: %v", finalLabel, err))
+		final = mergeDeterministic(base, cands)
 	}
-	ids := assignIDs(cands)
+	if problems := final.Validate(); len(problems) > 0 {
+		*errors = append(*errors, fmt.Sprintf("compose %s invalid: %s", finalLabel, strings.Join(problems, "; ")))
+		final = copyTree(base)
+	}
+	f := Candidate{Label: finalLabel, Dim: "FINAL", Tree: final, Base: base, KeptBase: harness.Diff(base, final).Empty()}
+	res.Ledger.Rollout(finalLabel, e.cfg.ProbeExec, false)
+	return &f, nil
+}
+
+// probeOne measures a candidate. When an executor is installed the candidate really runs; when it
+// is not, the result is explicitly recorded as a prediction and the ledger says so.
+func (e *Engine) probeOne(ctx context.Context, c *Candidate, evidence string, res *Result) {
+	if e.probeRunner != nil && e.cfg.ProbeExec {
+		ev := e.probeRunner.Probe(ctx, *c, evidence)
+		c.Probe = Probe{
+			Label: c.Label, Score: ev.Score(), Observed: ev.Observed, Confounded: ev.Confounded,
+			Executed: ev.Executed, TestPassed: ev.TestPassed, Graded: ev.Graded,
+		}
+		res.Ledger.Rollout(c.Label, ev.Executed, false)
+		return
+	}
+	if e.cfg.Mode == "dry" || e.llm == nil {
+		c.Probe = Probe{Label: c.Label, Score: 0, Observed: "dry run: no execution", Confounded: true}
+		return
+	}
+	mission := ProbePrompt(c.Label, evidence)
+	reply, err := e.call(ctx, mission, "候选 harness：\n"+renderTree(c.Tree))
+	if err != nil {
+		c.Probe = Probe{Label: c.Label, Observed: "probe failed: " + err.Error(), Confounded: true, Predicted: true}
+		return
+	}
+	p := parseProbe(reply, c.Label)
+	p.Predicted = true
+	c.Probe = p
+	res.Ledger.Rollout(c.Label, false, false)
+}
+
+// selectCandidate performs blind selection over anonymized ids: an id carries no information about
+// which candidate produced what.
+func (e *Engine) selectCandidate(ctx context.Context, pool []Candidate, res *Result) (*Candidate, error) {
+	if len(pool) == 0 {
+		return nil, nil
+	}
+	if e.cfg.Mode == "dry" || e.llm == nil {
+		res.Selection.Fallback = true
+		return bestByEvidence(pool), nil
+	}
+	ids := AssignIDs(labels(pool), res.Selection.TaskID, res.Selection.K, res.Selection.Mode)
+	res.Selection.IDMap = ids
 	var b strings.Builder
 	for _, anon := range sortedKeys(ids) {
-		label := ids[anon]
-		c := findByLabel(cands, label)
+		c := findByLabel(pool, ids[anon])
 		if c == nil {
 			continue
 		}
 		b.WriteString("## " + anon + "\n" + renderTree(c.Tree) + "\n")
 		if c.Notes != "" {
-			b.WriteString("notes: " + c.Notes + "\n\n")
+			b.WriteString("notes: " + c.Notes + "\n")
 		}
+		if c.Probe.Observed != "" {
+			b.WriteString("observed: " + c.Probe.Observed + "\n")
+		}
+		b.WriteString("\n")
 	}
-	reply, err := e.call(ctx, SelectPrompt(len(cands)), b.String())
+	reply, err := e.call(ctx, SelectPrompt(len(pool)), b.String())
 	if err != nil {
 		return nil, err
 	}
 	anon := parseChoice(reply)
-	label, ok := ids[anon]
-	if !ok {
-		return nil, fmt.Errorf("selection returned unknown id %q", anon)
+	why := parseWhy(reply)
+	return res.Selection.Choose(anon, why)
+}
+
+// bestByEvidence is the fallback choice: measured results first, then the original order.
+func bestByEvidence(pool []Candidate) *Candidate {
+	ordered := OrderGradedFirst(pool)
+	if len(ordered) == 0 {
+		return nil
 	}
-	if c := findByLabel(cands, label); c != nil {
-		return c, nil
+	best := ordered[0]
+	for _, c := range ordered {
+		if c.Probe.Score > best.Probe.Score {
+			best = c
+		}
 	}
-	return nil, nil
+	return &best
 }
 
 func (e *Engine) compose(ctx context.Context, base harness.Tree, cands []Candidate, evidence string) (harness.Tree, error) {
@@ -278,8 +449,8 @@ func (e *Engine) compose(ctx context.Context, base harness.Tree, cands []Candida
 	var b strings.Builder
 	b.WriteString("base harness：\n" + renderTree(base) + "\n\n候选：\n")
 	for _, c := range cands {
-		b.WriteString(fmt.Sprintf("### %s (%s, probe score %d, confounded=%v)\n%s\n",
-			c.Label, c.Dim, c.Probe.Score, c.Probe.Confounded, renderTree(c.Tree)))
+		b.WriteString(fmt.Sprintf("### %s (%s, probe score %d, confounded=%v, measured=%v)\n%s\n",
+			c.Label, c.Dim, c.Probe.Score, c.Probe.Confounded, c.Probe.Graded, renderTree(c.Tree)))
 		if c.Probe.Observed != "" {
 			b.WriteString("observed: " + c.Probe.Observed + "\n")
 		}
@@ -295,14 +466,27 @@ func (e *Engine) compose(ctx context.Context, base harness.Tree, cands []Candida
 	return ParseProposal(reply, base).Tree, nil
 }
 
-func (e *Engine) reflect(ctx context.Context, base, final harness.Tree, cands []Candidate, evidence string) ([]domain.HarnessEdit, *domain.HarnessLesson, error) {
+func (e *Engine) reflect(ctx context.Context, base, final harness.Tree, cands, finals []Candidate, evidence string) ([]domain.HarnessEdit, *domain.HarnessLesson, error) {
 	if e.cfg.Mode == "dry" || e.llm == nil {
 		return deterministicRows(base, final, cands), nil, nil
 	}
 	var b strings.Builder
 	b.WriteString("base：\n" + renderTree(base) + "\n\n最终：\n" + renderTree(final) + "\n\n")
 	for _, c := range cands {
-		b.WriteString(fmt.Sprintf("候选 %s (%s): %s | observed: %s\n", c.Label, c.Dim, c.Notes, c.Probe.Observed))
+		kind := "预测"
+		if c.Probe.Graded {
+			kind = "实测"
+		}
+		b.WriteString(fmt.Sprintf("候选 %s (%s, %s): %s | observed: %s\n", c.Label, c.Dim, kind, c.Notes, c.Probe.Observed))
+	}
+	if len(finals) > 0 {
+		b.WriteString("\n选择：池 " + strings.Join(labels(finals), ", "))
+		if len(finals) == 1 {
+			b.WriteString("；最终由该分支组装")
+		} else {
+			b.WriteString("；盲选在这些最终产物之间进行")
+		}
+		b.WriteString("\n")
 	}
 	reply, err := e.call(ctx, ReflectPrompt(evidence), b.String())
 	if err != nil {
@@ -350,11 +534,39 @@ func (e *Engine) persist(ctx context.Context, res *Result) error {
 			return err
 		}
 	}
+	if res.Ledger != nil {
+		if err := e.store.AddHarnessLedger(ctx, res.Round.ID, res.Ledger.Mode, res.Ledger.TaskID, res.Ledger.K, ledgerRows(res.Ledger)); err != nil {
+			return err
+		}
+	}
 	dir := e.Dir(res.Round.ProjectID)
 	if err := res.Final.Write(dir); err != nil {
 		return err
 	}
-	return writeIndex(dir, res)
+	if err := writeIndex(dir, res); err != nil {
+		return err
+	}
+	// Completion is recorded only after the run returned normally and its output was written.
+	if res.Round.TaskID != "" {
+		mark := &store.Runmark{
+			TaskID: res.Round.TaskID, HarnessHash: Fingerprint(res.Final), Mode: res.Round.Mode, K: res.Round.K,
+			RoundID: res.Round.ID, Chosen: res.Chosen, Completed: true, Version: RunmarkVersion,
+		}
+		mark.ID = store.RunmarkID(mark.TaskID, mark.HarnessHash, mark.Mode, mark.K)
+		if err := e.store.SaveRunmark(ctx, mark); err != nil {
+			return err
+		}
+		res.Round.Runmark = mark.ID
+	}
+	return nil
+}
+
+func ledgerRows(l *Ledger) []store.LedgerEntry {
+	out := make([]store.LedgerEntry, 0, len(l.Entries))
+	for _, e := range l.Entries {
+		out = append(out, store.LedgerEntry{Kind: e.Kind, Label: e.Label, Measured: e.Measured, Cached: e.Cached, Attempts: e.Attempts, Tokens: e.Tokens})
+	}
+	return out
 }
 
 func (e *Engine) call(ctx context.Context, mission, user string) (string, error) {
@@ -381,18 +593,15 @@ func (e *Engine) call(ctx context.Context, mission, user string) (string, error)
 
 // --- deterministic helpers (dry mode and fallbacks) ---
 
-func dryCandidates(base harness.Tree, round int) []Candidate {
-	var out []Candidate
-	for _, dim := range []string{"INV", "DOM"} {
-		out = append(out, Candidate{
-			Label:    fmt.Sprintf("r%d-%s-1", round, dim),
-			Dim:      dim,
-			Tree:     copyTree(base),
-			Notes:    "dry run: no model call; proposal skipped",
-			KeptBase: true,
-		})
+func dryCandidate(base harness.Tree, label, dim string) Candidate {
+	return Candidate{
+		Label:    label,
+		Dim:      dim,
+		Tree:     copyTree(base),
+		Base:     base,
+		Notes:    "dry run: no model call; proposal skipped",
+		KeptBase: true,
 	}
-	return out
 }
 
 // mergeDeterministic keeps base and applies only the highest-scoring candidate, used when
@@ -433,38 +642,10 @@ func deterministicRows(base, final harness.Tree, cands []Candidate) []domain.Har
 	return rows
 }
 
-func assignIDs(cands []Candidate) map[string]string {
-	var seed int64
+func labels(cands []Candidate) []string {
+	out := make([]string, 0, len(cands))
 	for _, c := range cands {
-		for _, r := range c.Label {
-			seed += int64(r)
-		}
-	}
-	ordered := make([]string, 0, len(cands))
-	for _, c := range cands {
-		ordered = append(ordered, c.Label)
-	}
-	sort.Strings(ordered)
-	rng := rand.New(rand.NewSource(seed))
-	rng.Shuffle(len(ordered), func(i, j int) { ordered[i], ordered[j] = ordered[j], ordered[i] })
-	out := map[string]string{}
-	for i, label := range ordered {
-		out[anonID(i)] = label
-	}
-	return out
-}
-
-func anonID(i int) string {
-	if i < 26 {
-		return string(rune('A' + i))
-	}
-	return string(rune('A'+i/26)) + string(rune('A'+i%26))
-}
-
-func sortedKeys(m map[string]string) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
+		out = append(out, c.Label)
 	}
 	sort.Strings(out)
 	return out
@@ -517,6 +698,23 @@ func composeNotes(cands []Candidate) string {
 	return strings.TrimSpace(b.String())
 }
 
+func sortedKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func parseWhy(text string) string {
+	if m := reWhy.FindStringSubmatch(text); len(m) > 1 {
+		return strings.TrimSpace(m[1])
+	}
+	return ""
+}
+
+// defaultHarness is the fallback used when a scope has no seeded harness yet.
 func defaultHarness() harness.Tree {
 	return harness.Tree{
 		harness.AgentsFile: `# 代码项目 agent

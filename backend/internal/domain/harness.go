@@ -50,4 +50,14 @@ type HarnessRound struct {
 	AlwaysOn  int       `json:"alwaysOnChars"`
 	Errors    []string  `json:"errors,omitempty"`
 	CreatedAt time.Time `json:"createdAt"`
+	// TaskID is the stable identity of the task this round was run for; Runmark is the trial
+	// identity (task + harness + mode + k) that lets a finished run be resumed instead of repeated.
+	TaskID    string   `json:"taskId,omitempty"`
+	Runmark   string   `json:"runmark,omitempty"`
+	LedgerR   int      `json:"ledgerR"`
+	LedgerP   int      `json:"ledgerP"`
+	MeasuredR int      `json:"measuredR"`
+	Pool      []string `json:"pool,omitempty"`
+	Dropped   []string `json:"dropped,omitempty"`
+	Cached    bool     `json:"cached"`
 }

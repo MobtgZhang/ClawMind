@@ -80,13 +80,6 @@ func (p *Proposal) KeptBase() bool { return harness.Diff(p.Base, p.Tree).Empty()
 
 // Probe is one candidate's predicted effect on the recorded trajectory. It is always a
 // prediction: the candidate was not executed, so the observation is behavioural, not measured.
-type Probe struct {
-	Label      string `json:"label"`
-	Score      int    `json:"score"`
-	Observed   string `json:"observed,omitempty"`
-	Confounded bool   `json:"confounded"`
-}
-
 var (
 	reProbe      = regexp.MustCompile(`(?s)<probe>(.*?)</probe>`)
 	reChoice     = regexp.MustCompile("(?s)```choice\\s*\\n?\\s*([A-Za-z0-9_-]+)\\s*\\n?```")
