@@ -3,46 +3,68 @@ package memory
 import (
 	"context"
 	"database/sql"
-	"sort"
+	"fmt"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-const (
-	maxL1Rows = 150
-	maxL2Rows = 100
-	maxL3Rows = 200
-)
-
 // EmbedFunc optionally embeds text for semantic memory retrieval.
 type EmbedFunc func(ctx context.Context, text string) ([]float32, error)
 
-// SQLiteStore persists L1–L3 memory in SQLite (tables agent_memory, agent_memory_embedding).
+// SQLiteStore persists L0–L3 memory in SQLite (tables agent_memory, agent_memory_embedding).
 type SQLiteStore struct {
-	db           *sql.DB
-	Embed        EmbedFunc
-	SemanticTopK int
+	db *sql.DB
+	// Embed optionally adds the vector half of the hybrid retrieval. Without it the store still
+	// retrieves with BM25, so the hybrid path is not dependent on a provider being configured.
+	Embed EmbedFunc
+	// Ret is the hybrid retriever: bootstrap layers plus BM25 + vector + RRF fallback.
+	Ret *Retriever
+	// Cap is the per-layer item limit.
+	Cap LayerCap
 }
 
-// NewSQLiteStore creates a store backed by the given DB (same file as main app DB).
+// NewSQLiteStore creates a store backed by the given DB (same file as the main app DB).
 func NewSQLiteStore(db *sql.DB) *SQLiteStore {
-	return &SQLiteStore{db: db, SemanticTopK: 8}
+	return &SQLiteStore{db: db, Ret: NewRetriever(nil), Cap: DefaultLayerCap()}
 }
 
-func (s *SQLiteStore) semanticK() int {
-	if s.SemanticTopK < 1 {
-		return 8
+// EnsureSchema creates the memory tables. It is idempotent so a plugin that owns a memory seam
+// can create its own storage without reaching into the app migration.
+func (s *SQLiteStore) EnsureSchema() error {
+	if s.db == nil {
+		return fmt.Errorf("memory: no database")
 	}
-	if s.SemanticTopK > 40 {
-		return 40
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS agent_memory (
+  id TEXT PRIMARY KEY,
+  level INTEGER NOT NULL,
+  session_id TEXT NOT NULL DEFAULT '',
+  project_id TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL,
+  content TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);`,
+		`CREATE INDEX IF NOT EXISTS idx_agent_memory_session_level ON agent_memory(session_id, level, created_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_agent_memory_project_level ON agent_memory(project_id, level, created_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_agent_memory_level_time ON agent_memory(level, created_at);`,
+		`CREATE TABLE IF NOT EXISTS agent_memory_embedding (
+  memory_id TEXT PRIMARY KEY REFERENCES agent_memory(id) ON DELETE CASCADE,
+  dim INTEGER NOT NULL,
+  embedding BLOB NOT NULL
+);`,
 	}
-	return s.SemanticTopK
+	for _, q := range stmts {
+		if _, err := s.db.Exec(q); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *SQLiteStore) Append(ctx context.Context, sessionID, kind, content string) error {
-	return s.AppendLevel(ctx, sessionID, "", 1, kind, content)
+	return s.AppendLevel(ctx, sessionID, "", int(LayerAtom), kind, content)
 }
 
 func (s *SQLiteStore) AppendLevel(ctx context.Context, sessionID, projectID string, level int, kind, content string) error {
@@ -50,27 +72,25 @@ func (s *SQLiteStore) AppendLevel(ctx context.Context, sessionID, projectID stri
 	if content == "" {
 		return nil
 	}
-	switch level {
-	case 3:
-	case 2:
-		if projectID == "" {
-			return nil
-		}
-	case 1, 0:
+	layer := Layer(level)
+	if layer < LayerConversation || layer > LayerPersona {
+		return nil
+	}
+	switch layer {
+	case LayerConversation, LayerAtom:
 		if sessionID == "" {
 			return nil
 		}
-		if level == 0 {
-			level = 1
+	case LayerScenario:
+		if projectID == "" {
+			return nil
 		}
-	default:
-		return nil
 	}
 	id := uuid.NewString()
 	now := time.Now().UnixMilli()
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO agent_memory (id, level, session_id, project_id, kind, content, created_at) VALUES (?,?,?,?,?,?,?)`,
-		id, level, sessionID, projectID, kind, content, now,
+		id, int(layer), sessionID, projectID, kind, content, now,
 	)
 	if err != nil {
 		return err
@@ -84,34 +104,39 @@ func (s *SQLiteStore) AppendLevel(ctx context.Context, sessionID, projectID stri
 			)
 		}
 	}
-	return s.pruneAfterAppend(ctx, level, sessionID, projectID)
+	return s.pruneLayer(ctx, layer, sessionID, projectID)
 }
 
-func (s *SQLiteStore) pruneAfterAppend(ctx context.Context, level int, sessionID, projectID string) error {
-	switch level {
-	case 3:
-		return s.pruneByQuery(ctx, `SELECT COUNT(*) FROM agent_memory WHERE level=3`, nil,
-			`DELETE FROM agent_memory WHERE id = (SELECT id FROM agent_memory WHERE level=3 ORDER BY created_at ASC LIMIT 1)`, maxL3Rows)
-	case 2:
-		return s.pruneByQuery(ctx, `SELECT COUNT(*) FROM agent_memory WHERE level=2 AND project_id=?`, []any{projectID},
-			`DELETE FROM agent_memory WHERE id = (SELECT id FROM agent_memory WHERE level=2 AND project_id=? ORDER BY created_at ASC LIMIT 1)`, maxL2Rows, projectID)
-	default:
-		return s.pruneByQuery(ctx, `SELECT COUNT(*) FROM agent_memory WHERE level=1 AND session_id=?`, []any{sessionID},
-			`DELETE FROM agent_memory WHERE id = (SELECT id FROM agent_memory WHERE level=1 AND session_id=? ORDER BY created_at ASC LIMIT 1)`, maxL1Rows, sessionID)
+func (s *SQLiteStore) pruneLayer(ctx context.Context, layer Layer, sessionID, projectID string) error {
+	limit := s.Cap.forLayer(layer)
+	if limit <= 0 {
+		return nil
 	}
-}
-
-func (s *SQLiteStore) pruneByQuery(ctx context.Context, countQ string, countArgs []any, delQ string, limit int, delArgs ...any) error {
+	var countQ string
+	var delQ string
+	var args []any
+	switch layer {
+	case LayerPersona:
+		countQ = `SELECT COUNT(*) FROM agent_memory WHERE level=3`
+		delQ = `DELETE FROM agent_memory WHERE id = (SELECT id FROM agent_memory WHERE level=3 ORDER BY created_at ASC LIMIT 1)`
+	case LayerScenario:
+		countQ = `SELECT COUNT(*) FROM agent_memory WHERE level=2 AND project_id=?`
+		delQ = `DELETE FROM agent_memory WHERE id = (SELECT id FROM agent_memory WHERE level=2 AND project_id=? ORDER BY created_at ASC LIMIT 1)`
+		args = []any{projectID}
+	default:
+		countQ = `SELECT COUNT(*) FROM agent_memory WHERE level=? AND session_id=?`
+		delQ = `DELETE FROM agent_memory WHERE id = (SELECT id FROM agent_memory WHERE level=? AND session_id=? ORDER BY created_at ASC LIMIT 1)`
+		args = []any{int(layer), sessionID}
+	}
 	for {
-		row := s.db.QueryRowContext(ctx, countQ, countArgs...)
 		var cnt int
-		if err := row.Scan(&cnt); err != nil {
+		if err := s.db.QueryRowContext(ctx, countQ, args...).Scan(&cnt); err != nil {
 			return err
 		}
 		if cnt <= limit {
 			return nil
 		}
-		res, err := s.db.ExecContext(ctx, delQ, delArgs...)
+		res, err := s.db.ExecContext(ctx, delQ, args...)
 		if err != nil {
 			return err
 		}
@@ -122,126 +147,52 @@ func (s *SQLiteStore) pruneByQuery(ctx context.Context, countQ string, countArgs
 	}
 }
 
-func (s *SQLiteStore) Retrieve(ctx context.Context, sessionID, query string) ([]string, error) {
-	return s.RetrieveLevels(ctx, sessionID, "", query)
-}
-
-func (s *SQLiteStore) RetrieveLevels(ctx context.Context, sessionID, projectID, query string) ([]string, error) {
-	q := strings.ToLower(strings.TrimSpace(query))
-	if s.Embed != nil && q != "" {
-		if sem, err := s.retrieveSemantic(ctx, sessionID, projectID, query); err == nil && len(sem) > 0 {
-			return trimLines(sem, 40), nil
-		}
+// Rows loads candidate rows for retrieval, embeddings included, newest first.
+func (s *SQLiteStore) Rows(ctx context.Context, sessionID, projectID string, limit int) ([]Row, error) {
+	if limit <= 0 {
+		limit = 400
 	}
-	return s.retrieveSubstring(ctx, sessionID, projectID, q)
-}
-
-func trimLines(out []string, max int) []string {
-	if len(out) <= max {
-		return out
-	}
-	return out[len(out)-max:]
-}
-
-type scoredLine struct {
-	score float64
-	line  string
-}
-
-func (s *SQLiteStore) retrieveSemantic(ctx context.Context, sessionID, projectID, query string) ([]string, error) {
-	qvec, err := s.Embed(ctx, query)
-	if err != nil || len(qvec) == 0 {
-		return nil, err
-	}
+	args := []any{projectID, sessionID, limit}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT m.id, m.level, m.kind, m.content, e.embedding
+SELECT m.id, m.level, m.session_id, m.project_id, m.kind, m.content, m.created_at, e.embedding
 FROM agent_memory m
 LEFT JOIN agent_memory_embedding e ON e.memory_id = m.id
-WHERE m.level=3 OR (m.level=2 AND m.project_id=?) OR (m.level=1 AND m.session_id=?)
-ORDER BY m.created_at DESC
-LIMIT 400`, projectID, sessionID)
+WHERE (m.level=3) OR (m.level=2 AND m.project_id=?) OR (m.level IN (0,1) AND m.session_id=?)
+ORDER BY m.created_at ASC
+LIMIT ?`, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var scored []scoredLine
-	qLower := strings.ToLower(strings.TrimSpace(query))
+	var out []Row
 	for rows.Next() {
-		var id string
+		var r Row
 		var level int
-		var kind, content string
-		var embBlob []byte
-		if err := rows.Scan(&id, &level, &kind, &content, &embBlob); err != nil {
+		var emb []byte
+		if err := rows.Scan(&r.ID, &level, &r.SessionID, &r.ProjectID, &r.Kind, &r.Content, &r.CreatedAt, &emb); err != nil {
 			continue
 		}
-		label := "[L1]"
-		switch level {
-		case 3:
-			label = "[L3]"
-		case 2:
-			label = "[L2]"
-		}
-		line := label + " [" + kind + "] " + content
-		vec := blobFloat32(embBlob)
-		if len(vec) > 0 && len(vec) == len(qvec) {
-			sc := cosineSim(qvec, vec)
-			scored = append(scored, scoredLine{score: sc, line: line})
-		} else if qLower != "" && strings.Contains(strings.ToLower(content), qLower) {
-			scored = append(scored, scoredLine{score: 0.05, line: line})
-		}
+		r.Layer = Layer(level)
+		r.Embedding = blobFloat32(emb)
+		out = append(out, r)
 	}
-	if len(scored) == 0 {
-		return nil, nil
-	}
-	sort.Slice(scored, func(i, j int) bool { return scored[i].score > scored[j].score })
-	k := s.semanticK()
-	if k > len(scored) {
-		k = len(scored)
-	}
-	out := make([]string, 0, k)
-	seen := make(map[string]struct{})
-	for i := 0; i < len(scored) && len(out) < k; i++ {
-		ln := scored[i].line
-		if _, ok := seen[ln]; ok {
-			continue
-		}
-		seen[ln] = struct{}{}
-		out = append(out, ln)
-	}
-	return out, nil
+	return out, rows.Err()
 }
 
-func (s *SQLiteStore) retrieveSubstring(ctx context.Context, sessionID, projectID, query string) ([]string, error) {
-	var out []string
-	appendRows := func(label, q string, args ...any) error {
-		rows, err := s.db.QueryContext(ctx, q, args...)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var kind, content string
-			if err := rows.Scan(&kind, &content); err != nil {
-				continue
-			}
-			if query == "" || strings.Contains(strings.ToLower(content), query) {
-				out = append(out, label+" ["+kind+"] "+content)
-			}
-		}
-		return rows.Err()
-	}
-	if err := appendRows("[L3]", `SELECT kind, content FROM agent_memory WHERE level=3 ORDER BY created_at ASC`); err != nil {
+func (s *SQLiteStore) Retrieve(ctx context.Context, sessionID, query string) ([]string, error) {
+	return s.RetrieveLevels(ctx, sessionID, "", query)
+}
+
+// RetrieveLevels performs the layered hybrid retrieval: L2/L3 bootstrap, then BM25 + vector + RRF
+// over L0/L1, capped by the retrieval budget.
+func (s *SQLiteStore) RetrieveLevels(ctx context.Context, sessionID, projectID, query string) ([]string, error) {
+	pool, err := s.Rows(ctx, sessionID, projectID, 400)
+	if err != nil {
 		return nil, err
 	}
-	if projectID != "" {
-		if err := appendRows("[L2]", `SELECT kind, content FROM agent_memory WHERE level=2 AND project_id=? ORDER BY created_at ASC`, projectID); err != nil {
-			return nil, err
-		}
+	if s.Ret == nil {
+		s.Ret = NewRetriever(s.Embed)
 	}
-	if sessionID != "" {
-		if err := appendRows("[L1]", `SELECT kind, content FROM agent_memory WHERE level=1 AND session_id=? ORDER BY created_at ASC`, sessionID); err != nil {
-			return nil, err
-		}
-	}
-	return trimLines(out, 40), nil
+	s.Ret.Embed = s.Embed
+	return s.Ret.Search(ctx, pool, query)
 }

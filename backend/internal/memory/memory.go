@@ -6,8 +6,10 @@ import (
 	"sync"
 )
 
-// Store is a pluggable memory layer with L0–L3 tiers for the agent.
-// L0: live conversation (not stored here). L1: session. L2: project. L3: global.
+// Store is the pluggable memory layer. The seam is deliberately narrow: a plugin can replace the
+// storage backend without touching the agent.
+//
+// Layers: L0 conversation (raw), L1 atom, L2 scenario, L3 persona.
 type Store interface {
 	Append(ctx context.Context, sessionID, kind, content string) error
 	Retrieve(ctx context.Context, sessionID, query string) ([]string, error)
@@ -15,93 +17,155 @@ type Store interface {
 	RetrieveLevels(ctx context.Context, sessionID, projectID, query string) ([]string, error)
 }
 
-// InMemoryStore keeps rows per session, optional project bucket, and global.
-type InMemoryStore struct {
-	mu         sync.RWMutex
-	rows       map[string][]memoryRow // sessionID -> L1-ish
-	projRows   map[string][]memoryRow // projectID -> L2
-	globalRows []memoryRow            // L3
+// LayerCap is the per-layer item limit. A layer that grows without a cap eventually pushes the
+// rest of the context out, which is the failure mode this design is trying to prevent.
+type LayerCap struct {
+	L0 int
+	L1 int
+	L2 int
+	L3 int
 }
 
-type memoryRow struct {
-	Kind    string
-	Content string
+func DefaultLayerCap() LayerCap {
+	return LayerCap{L0: 400, L1: 150, L2: 100, L3: 200}
+}
+
+func (c LayerCap) forLayer(layer Layer) int {
+	switch layer {
+	case LayerConversation:
+		return c.L0
+	case LayerScenario:
+		return c.L2
+	case LayerPersona:
+		return c.L3
+	default:
+		return c.L1
+	}
+}
+
+// ForLayer is the exported form: the layer census needs the cap next to the count, otherwise a
+// full layer looks like a normal layer rather than one that is pushing the context out.
+func (c LayerCap) ForLayer(layer Layer) int { return c.forLayer(layer) }
+
+// SetLayer lowers one layer cap. Callers are expected to only lower a cap: a patch layer that could
+// raise it would let a layer grow past the budget the cap exists to protect.
+func (c *LayerCap) SetLayer(layer Layer, n int) {
+	if n <= 0 {
+		return
+	}
+	switch layer {
+	case LayerConversation:
+		c.L0 = n
+	case LayerScenario:
+		c.L2 = n
+	case LayerPersona:
+		c.L3 = n
+	default:
+		c.L1 = n
+	}
+}
+
+// InMemoryStore keeps rows per session, an optional project bucket, and the global layer.
+type InMemoryStore struct {
+	mu       sync.RWMutex
+	rows     map[string][]Row
+	projRows map[string][]Row
+	global   []Row
+	// Cap is the per-layer limit this store enforces when trimming. It is exported so the boot
+	// sequence can apply the memory layer: a cap the census reports but the store never applies is
+	// the same declared-but-unconsumed failure the plugin seam is meant to prevent.
+	Cap LayerCap
+	Ret *Retriever
 }
 
 func NewInMemoryStore() *InMemoryStore {
 	return &InMemoryStore{
-		rows:     make(map[string][]memoryRow),
-		projRows: make(map[string][]memoryRow),
+		rows:     map[string][]Row{},
+		projRows: map[string][]Row{},
+		Cap:      DefaultLayerCap(),
+		Ret:      NewRetriever(nil),
 	}
 }
 
 func (s *InMemoryStore) Append(ctx context.Context, sessionID, kind, content string) error {
-	return s.AppendLevel(ctx, sessionID, "", 1, kind, content)
+	return s.AppendLevel(ctx, sessionID, "", int(LayerAtom), kind, content)
 }
 
 func (s *InMemoryStore) AppendLevel(ctx context.Context, sessionID, projectID string, level int, kind, content string) error {
-	_ = ctx
 	content = strings.TrimSpace(content)
 	if content == "" {
 		return nil
 	}
-	row := memoryRow{Kind: kind, Content: content}
+	layer := Layer(level)
+	if layer < LayerConversation || layer > LayerPersona {
+		return nil
+	}
+	row := Row{Layer: layer, SessionID: sessionID, ProjectID: projectID, Kind: kind, Content: content}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	switch level {
-	case 3:
-		s.globalRows = append(s.globalRows, row)
-		if len(s.globalRows) > 200 {
-			s.globalRows = s.globalRows[len(s.globalRows)-200:]
-		}
-	case 2:
+	switch layer {
+	case LayerPersona:
+		s.global = append(s.global, row)
+		s.global = s.trim(s.global, s.Cap.ForLayer(layer))
+	case LayerScenario:
 		if projectID == "" {
 			return nil
 		}
 		s.projRows[projectID] = append(s.projRows[projectID], row)
-		if len(s.projRows[projectID]) > 100 {
-			s.projRows[projectID] = s.projRows[projectID][len(s.projRows[projectID])-100:]
-		}
-	default: // L1 / L0-style session scratch
+		s.projRows[projectID] = s.trim(s.projRows[projectID], s.Cap.ForLayer(layer))
+	default:
 		if sessionID == "" {
 			return nil
 		}
 		s.rows[sessionID] = append(s.rows[sessionID], row)
-		if len(s.rows[sessionID]) > 150 {
-			s.rows[sessionID] = s.rows[sessionID][len(s.rows[sessionID])-150:]
-		}
+		s.rows[sessionID] = s.trim(s.rows[sessionID], s.Cap.ForLayer(layer))
 	}
 	return nil
+}
+
+func (s *InMemoryStore) trim(target []Row, limit int) []Row {
+	if limit <= 0 || len(target) <= limit {
+		return target
+	}
+	return target[len(target)-limit:]
 }
 
 func (s *InMemoryStore) Retrieve(ctx context.Context, sessionID, query string) ([]string, error) {
 	return s.RetrieveLevels(ctx, sessionID, "", query)
 }
 
-func (s *InMemoryStore) RetrieveLevels(ctx context.Context, sessionID, projectID, query string) ([]string, error) {
+// Rows returns the stored rows, newest last, so a pipeline can merge a layer with what is
+// already there.
+func (s *InMemoryStore) Rows(ctx context.Context, sessionID, projectID string, limit int) ([]Row, error) {
 	_ = ctx
-	q := strings.ToLower(strings.TrimSpace(query))
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	var out []string
-	add := func(label string, rows []memoryRow) {
-		for _, r := range rows {
-			if q == "" || strings.Contains(strings.ToLower(r.Content), q) {
-				out = append(out, label+" ["+r.Kind+"] "+r.Content)
-			}
-		}
-	}
-	add("[L3]", s.globalRows)
+	var pool []Row
+	pool = append(pool, s.global...)
 	if projectID != "" {
-		add("[L2]", s.projRows[projectID])
+		pool = append(pool, s.projRows[projectID]...)
 	}
 	if sessionID != "" {
-		add("[L1]", s.rows[sessionID])
+		pool = append(pool, s.rows[sessionID]...)
 	}
-	if len(out) > 40 {
-		out = out[len(out)-40:]
+	if limit > 0 && len(pool) > limit {
+		pool = pool[len(pool)-limit:]
 	}
-	return out, nil
+	return pool, nil
+}
+
+func (s *InMemoryStore) RetrieveLevels(ctx context.Context, sessionID, projectID, query string) ([]string, error) {
+	s.mu.RLock()
+	var pool []Row
+	pool = append(pool, s.global...)
+	if projectID != "" {
+		pool = append(pool, s.projRows[projectID]...)
+	}
+	if sessionID != "" {
+		pool = append(pool, s.rows[sessionID]...)
+	}
+	s.mu.RUnlock()
+	return s.Ret.Search(ctx, pool, query)
 }
 
 // NoopStore implements Store with no persistence.
