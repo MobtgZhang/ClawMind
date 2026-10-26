@@ -83,6 +83,20 @@ func (t Tree) PromptBlock(maxChars int) string {
 			b.WriteString(fmt.Sprintf("- %s：%s\n", s.Name, desc))
 		}
 	}
+	subs := t.Subagents()
+	if len(subs) > 0 {
+		b.WriteString("\n## 可委派的子代理（delegate）\n\n")
+		for _, a := range subs {
+			if b.Len()+len(a.Name)+len(a.Description)+10 > maxChars {
+				break
+			}
+			desc := a.Description
+			if desc == "" {
+				desc = "（无描述）"
+			}
+			b.WriteString(fmt.Sprintf("- %s：%s\n", a.Name, desc))
+		}
+	}
 	return strings.TrimSpace(b.String())
 }
 

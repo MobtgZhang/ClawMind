@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -10,12 +11,17 @@ import (
 
 // Editable harness surface. Only these paths are on the surface; anything else is dropped.
 const (
-	AgentsFile   = "AGENTS.md"
-	GuidanceFile = "tool_guidance.md"
-	LessonsFile  = "lessons.md"
-	SkillDir     = "skills"
-	ScriptDir    = "scripts"
+	LessonsFile = "lessons.md"
 )
+
+// Subagent is one delegated component parsed from sub_agents/<name>/AGENT.md. It runs in its
+// own context and returns text, so its cost is not paid on every run.
+type Subagent struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Path        string `json:"path"`
+	Body        string `json:"body"`
+}
 
 // Tree is one harness: relative path -> file content.
 type Tree map[string]string
@@ -101,9 +107,14 @@ func (t Tree) Paths() []string {
 func (t Tree) AlwaysOnPaths() []string {
 	var out []string
 	for _, p := range t.Paths() {
-		if p == AgentsFile || p == GuidanceFile || p == LessonsFile {
-			out = append(out, p)
+		if ComponentKind(p) != "always_on" {
+			continue
 		}
+		// lessons.md is the legacy name for the memory component; memory.md wins when both exist.
+		if p == LessonsFile && strings.TrimSpace(t[MemoryFile]) != "" {
+			continue
+		}
+		out = append(out, p)
 	}
 	return out
 }
@@ -127,15 +138,82 @@ func (t Tree) Skills() []Skill {
 		}
 		name := strings.TrimSuffix(strings.TrimPrefix(rel, prefix), "/SKILL.md")
 		content := t[rel]
-		fm, body := splitFrontmatter(content)
-		desc := frontmatterValue(fm, "description")
-		fname := frontmatterValue(fm, "name")
+		fm, body := ParseFrontmatter(content)
+		desc := FrontmatterValue(fm, "description")
+		fname := FrontmatterValue(fm, "name")
 		if fname != "" && fname != name {
 			name = fname
 		}
 		out = append(out, Skill{Name: name, Description: desc, Path: rel, Body: body})
 	}
 	return out
+}
+
+// Subagents parses sub_agents/<name>/AGENT.md entries.
+func (t Tree) Subagents() []Subagent {
+	var out []Subagent
+	prefix := SubagentDir + "/"
+	for _, rel := range t.Paths() {
+		if !strings.HasPrefix(rel, prefix) || !strings.HasSuffix(rel, "/AGENT.md") {
+			continue
+		}
+		fm, body := ParseFrontmatter(t[rel])
+		if fm["mode"] != "subagent" {
+			continue
+		}
+		name := strings.TrimSuffix(strings.TrimPrefix(rel, prefix), "/AGENT.md")
+		if got := FrontmatterValue(fm, "name"); got != "" {
+			name = got
+		}
+		out = append(out, Subagent{
+			Name: name, Description: FrontmatterValue(fm, "description"),
+			Path: rel, Body: strings.TrimSpace(body),
+		})
+	}
+	return out
+}
+
+// Plugins lists plugins/<name>.json entries; the plugin registry parses them at boot.
+func (t Tree) Plugins() []string {
+	var out []string
+	prefix := PluginDir + "/"
+	for _, rel := range t.Paths() {
+		if strings.HasPrefix(rel, prefix) && rel != prefix {
+			out = append(out, rel)
+		}
+	}
+	return out
+}
+
+// WithContributions returns a copy of the tree with plugin-contributed components materialised.
+// The agent looks components up through one surface, so a skill or subagent mounted by a plugin
+// is reachable through load_skill and delegate without a second lookup path. The copy is never
+// written back: plugin contributions live in the plugin, not in the harness tree.
+func (t Tree) WithContributions(skills []Skill, subs []Subagent) Tree {
+	out := Tree{}
+	for rel, content := range t {
+		out[rel] = content
+	}
+	for _, s := range skills {
+		out[SkillDir+"/"+s.Name+"/SKILL.md"] = renderComponent(s.Name, s.Description, s.Body, "")
+	}
+	for _, a := range subs {
+		out[SubagentDir+"/"+a.Name+"/AGENT.md"] = renderComponent(a.Name, a.Description, a.Body, "subagent")
+	}
+	return out
+}
+
+func renderComponent(name, description, body string, mode string) string {
+	var b strings.Builder
+	b.WriteString("---\nname: " + name + "\n")
+	if description != "" {
+		b.WriteString("description: " + description + "\n")
+	}
+	if mode != "" {
+		b.WriteString("mode: " + mode + "\n")
+	}
+	b.WriteString("---\n" + strings.TrimSpace(body) + "\n")
+	return b.String()
 }
 
 // Scripts lists scripts/<name> entries.
@@ -211,12 +289,25 @@ func Diff(base, next Tree) DiffResult {
 var reTemplateBraces = regexp.MustCompile(`\{\{|\{%`)
 var reSnake = regexp.MustCompile(`^[a-z0-9_]+(\.[a-z0-9]+)?$`)
 
-// Validate enforces the three rules that make a proposal unusable at runtime:
-// every skill needs a trigger line in always-on text, every named script must exist,
-// and always-on text must not contain template braces.
+// Validate enforces the rules that make a proposal unusable at runtime: paths must stay on the
+// surface, every skill needs a trigger line in always-on text, every named script must exist and
+// compile, subagents need mode: subagent, plugins and hooks must parse, always-on text must not
+// contain template braces, and the always-on block must fit its cap. A proposal that fails
+// validation is discarded in full, never partially applied.
 func (t Tree) Validate() []string {
 	var problems []string
 	alwaysOn := strings.Join(t.alwaysOnText(), "\n")
+	spec := DefaultSpec()
+	for rel := range t {
+		if ComponentKind(rel) != "" {
+			continue
+		}
+		if strings.HasPrefix(rel, ScriptDir+"/") && strings.HasSuffix(rel, ".py") {
+			problems = append(problems, "script "+rel+": name must be snake_case")
+			continue
+		}
+		problems = append(problems, "off-surface path "+rel)
+	}
 	for _, s := range t.Skills() {
 		if s.Description == "" {
 			problems = append(problems, "skill "+s.Path+": missing frontmatter description")
@@ -230,15 +321,40 @@ func (t Tree) Validate() []string {
 			}
 		}
 	}
+	for _, a := range t.Subagents() {
+		if a.Description == "" {
+			problems = append(problems, "subagent "+a.Path+": missing frontmatter description")
+		}
+		if !strings.Contains(alwaysOn, a.Name) {
+			problems = append(problems, "subagent "+a.Path+": name "+a.Name+" is not named in always-on text (never delegated to)")
+		}
+	}
 	for _, rel := range t.Scripts() {
 		if !reSnake.MatchString(strings.TrimPrefix(rel, ScriptDir+"/")) {
 			problems = append(problems, "script "+rel+": name must be snake_case")
 		}
+		if reserved := ReservedScriptName(rel); reserved != "" {
+			problems = append(problems, "script "+rel+": "+reserved+" is reserved by the runtime")
+		}
+		if msg := pythonCompiles(rel, t[rel]); msg != "" {
+			problems = append(problems, "script "+rel+": "+msg)
+		}
+	}
+	for _, rel := range t.Plugins() {
+		if msg := pluginManifestProblem(t[rel]); msg != "" {
+			problems = append(problems, "plugin "+rel+": "+msg)
+		}
+	}
+	for _, msg := range hookProblems(t[HooksFile]) {
+		problems = append(problems, msg)
 	}
 	for _, p := range t.AlwaysOnPaths() {
 		if reTemplateBraces.MatchString(t[p]) {
 			problems = append(problems, "always-on text "+p+": template braces are not allowed")
 		}
+	}
+	if n := t.AlwaysOnChars(); n > spec.AlwaysOnMax {
+		problems = append(problems, fmt.Sprintf("always-on text %d chars exceeds cap %d", n, spec.AlwaysOnMax))
 	}
 	return problems
 }
@@ -254,7 +370,12 @@ func (t Tree) AutoTrigger() []string {
 		if strings.TrimSpace(alwaysOn) == "" {
 			alwaysOn = "# 角色与流程\n"
 		}
-		alwaysOn += "\n当遇到「" + firstClause(s.Description) + "」时，加载 `" + s.Name + "` 技能。\n"
+		line := "\n" + TriggerLine(DefaultSpec(), s.Name, firstClause(s.Description))
+		// A line that would push the always-on block over its cap is skipped, not added.
+		if len(strings.TrimSpace(alwaysOn))+len(line) > DefaultSpec().AlwaysOnMax {
+			continue
+		}
+		alwaysOn += line
 		fixed = append(fixed, s.Name)
 	}
 	if len(fixed) > 0 {
@@ -283,7 +404,9 @@ func referencedScripts(body string) []string {
 
 var reScriptRef = regexp.MustCompile(`scripts/[a-z0-9_]+\.[a-z0-9]+`)
 
-func splitFrontmatter(content string) (map[string]string, string) {
+// ParseFrontmatter splits a leading --- block from the body. Skills, subagents and plugins all
+// use the same contract, so the parser exists once.
+func ParseFrontmatter(content string) (map[string]string, string) {
 	fm := map[string]string{}
 	lines := strings.Split(content, "\n")
 	i := 0
@@ -302,7 +425,7 @@ func splitFrontmatter(content string) (map[string]string, string) {
 	return fm, strings.Join(lines[i:], "\n")
 }
 
-func frontmatterValue(fm map[string]string, key string) string {
+func FrontmatterValue(fm map[string]string, key string) string {
 	return strings.TrimSpace(fm[key])
 }
 
