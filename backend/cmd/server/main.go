@@ -14,6 +14,7 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/mobtgzhang/clawmind/backend/internal/api"
 	"github.com/mobtgzhang/clawmind/backend/internal/clawmindcfg"
+	"github.com/mobtgzhang/clawmind/backend/internal/evolution"
 	"github.com/mobtgzhang/clawmind/backend/internal/llm"
 	"github.com/mobtgzhang/clawmind/backend/internal/mcpclient"
 	"github.com/mobtgzhang/clawmind/backend/internal/memory"
@@ -105,6 +106,24 @@ func main() {
 	srv := api.NewServer(st, cfgMgr, client, mem, toolsPath, skillsPath, mcpSess)
 	slog.Info("skills file", "path", skillsPath)
 
+	harnessRoot := strings.TrimSpace(os.Getenv("CLAWMIND_HARNESS_DIR"))
+	if harnessRoot == "" {
+		harnessRoot = filepath.Join(clawDir, "harness")
+	}
+	if envBool("CLAWMIND_EVOLUTION", false) {
+		mode := getenv("CLAWMIND_EVOLUTION_MODE", "parallel")
+		k := envInt("CLAWMIND_EVOLUTION_K", 3)
+		srv.Harness = evolution.New(st, client, evolution.Config{
+			K:       k,
+			Mode:    mode,
+			Root:    harnessRoot,
+			BaseURL: resolved.BaseURL,
+			APIKey:  resolved.APIKey,
+			Model:   resolved.Model,
+		})
+		slog.Info("self-evolution engine", "mode", mode, "k", k, "root", harnessRoot)
+	}
+
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -147,6 +166,30 @@ func getenv(k, def string) string {
 		return def
 	}
 	return v
+}
+
+func envInt(k string, def int) int {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		return def
+	}
+	return n
+}
+
+func envBool(k string, def bool) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(k))) {
+	case "":
+		return def
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	}
+	return def
 }
 
 func devCORS() gin.HandlerFunc {
