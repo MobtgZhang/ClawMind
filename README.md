@@ -5,105 +5,153 @@
 </p>
 
 <p align="center">
-  <strong>本地优先的代码项目 Agent</strong><br/>
-  Go（Gin + SQLite + SSE）· Vue 3（Vite + Pinia + Tailwind）
-</p>
-
-<p align="center">
-  <img src="docs/assets/clawmind-assistant.png" width="56" height="56" alt="助手头像" />
-  &nbsp;&nbsp;
-  <img src="docs/assets/clawmind-user.png" width="56" height="56" alt="用户头像" />
+  <strong>A local-first coding agent for real repositories</strong><br/>
+  Go (Gin + SQLite + SSE) · Vue 3 (Vite + Pinia + Tailwind) · <a href="README_CN.md">中文文档</a>
 </p>
 
 ---
 
-## 简介
+ClawMind is not a general-purpose "do any task" assistant. It is scoped to **code work in a codebase**: it profiles a repository, locates the relevant symbols and call sites, makes exact edits, and then proves the change by running the project's own verification command. On top of that it carries a **self-evolving harness** — the agent may change how it works, but never the repository code.
 
-ClawMind 定位在**真实代码仓库**里工作：先定位、再改动、改后必验证。它提供 **ChatGPT 风格主列**（主区宽度约为侧栏以外区域的 **4/5 / 80%**）、**流式 Markdown**（含表格与代码块复制）、**可折叠的任务流程与思考过程**（Cursor Agent 式分段）、**代码工具 Agent**（搜索 / 结构 / 精确编辑 / 跑测试）与 **项目 / 技能 / 会话** 管理，并额外提供**自进化 harness**（agent 只能改自己的工作方式，不能改仓库代码）。模型与密钥等保存在 **`.clawmind/config.json`**，也可用环境变量作后备。
+Everything runs locally: a single Go binary, a pure-Go SQLite database (no CGO), and a Vue 3 frontend.
 
-**详细文档**见 **[docs/](docs/README.md)**（[代码项目助手](docs/code-agent.md)、[自进化](docs/self-evolution.md)、[特点与能力](docs/features.md)、[架构说明](docs/architecture.md)）。
+## Highlights
 
-## 前置条件
+- **Code-first loop** — locate → edit → verify → wrap up. A claimed fix is checked against the project, not asserted.
+- **Bounded repository awareness** — language mix, manifests, inferred `test`/`build`/`lint`/`format` commands and a capped file tree, without shelling out.
+- **Editable harness surface** — `AGENTS.md`, `tool_guidance.md`, `lessons.md`, `skills/`, `scripts/`. Always-on text is the most expensive component, so knowledge is pushed into on-demand skills and scripts.
+- **Evidence-constrained evolution** — Propose → Probe → Compose → blind Select → Reflect, with per-edit verdicts (`helped` / `hurt` / `no observed effect` / `confounded`). Keeping the baseline is a legitimate outcome.
+- **Transferable experience library** — `cue` → `lesson` per project, generalized rather than memorized, and treated as data, not as instructions.
+- **Streaming UI** — ChatGPT-style main column, collapsible task-flow and thinking segments, tool steps, GFM tables, code copy, KaTeX.
+- **Layered memory (L0–L3)** — session, project and global tiers persisted in SQLite, with optional semantic retrieval.
+- **Safety boundaries** — workspace root, blocked reads of local config/key files, human approval for high-risk shell, SSRF filtering on `web_fetch`.
 
-- Go 1.22+（SQLite 使用 **纯 Go** 驱动 `modernc.org/sqlite`，**无需 CGO**）
-- Node.js 18+（推荐 20+）
-- 兼容 OpenAI Chat Completions 的 API（设置中填写 Key，或 `OPENAI_API_KEY`）
+## Quick start
 
-## 快速开始
-
-```bash
-# 仓库根目录（推荐）
-make run
-```
-
-或分别启动：
+Prerequisites: Go 1.22+, Node.js 18+ (20+ recommended), and an OpenAI-compatible Chat Completions endpoint.
 
 ```bash
-cd backend
-go run ./cmd/server
+cp .env.example .env          # optional; the server also reads OS env
+make run                      # backend :8080 + frontend :5173
 ```
+
+Open <http://127.0.0.1:5173> (Vite proxies `/api` to `:8080`). Run the two halves separately with `make dev-backend` / `make dev-frontend`.
+
+Enable the self-evolution engine:
 
 ```bash
-cd frontend
-npm install && npm run dev
+CLAWMIND_EVOLUTION=1 make run
 ```
 
-浏览器访问 **`http://127.0.0.1:5173`**（Vite 将 `/api` 代理到 `:8080`）。
+Then open the **Harness** panel from the bottom of the sidebar.
 
-## 品牌资源
+## Code-first workflow
 
-| 资源 | 路径 |
-|------|------|
-| Logo（SVG） | [docs/assets/logo.svg](docs/assets/logo.svg) · 前端 [frontend/public/logo.svg](frontend/public/logo.svg) |
-| AI 助手头像（PNG） | [docs/assets/clawmind-assistant.png](docs/assets/clawmind-assistant.png) · `frontend/public/` |
-| 用户头像（PNG） | [docs/assets/clawmind-user.png](docs/assets/clawmind-user.png) · `frontend/public/` |
+The system prompt encodes four rules (`backend/internal/agent/prompts.go`, `backend/data/prompts/`):
 
-## 后端说明
+1. **Locate before editing** — search and read the context; never assume file contents.
+2. **Edit exactly** — `file_edit` fails when the target text is absent or ambiguous, which forces a re-read instead of a guess.
+3. **Verify after editing** — the inferred test command runs after any round that touched files, and failures are fed back into the run (`backend/internal/agent/verify.go`).
+4. **Deliverables belong to the user** — the shape of the output is the user's decision; the experience library is data, not instructions.
 
-默认监听 **`:8080`**，数据库 **`./data/clawmind.db`**。配置目录默认为仓库根下 **`.clawmind/`**（从 `backend/` 启动则为 **`../.clawmind/`**），可用 **`CLAWMIND_DIR`** 覆盖。
+## Tools
 
-### 环境变量（节选）
+Built-in atomic tools: `file_read`, `file_write`, `shell_exec`, `web_fetch`, `task_plan`, `task_summary`.
 
-| 变量 | 说明 |
-|------|------|
-| `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` | API 与模型后备 |
-| `LISTEN` | 监听地址，默认 `:8080` |
-| `DB_PATH` | SQLite 路径 |
-| `CLAWMIND_DIR` | `.clawmind` 目录（`config.json`、`skills.json`） |
-| `TOOLS_PATH` | 额外工具 JSON，与内置原子工具合并 |
-| `AGENT_WORKSPACE` | Agent 文件与 Shell 的工作区根路径 |
-| `CLAWMIND_MEMORY_BACKEND` | `sqlite`（默认）或 `memory`（进程内记忆，测试用） |
-| `CLAWMIND_EMBEDDING_MODEL` | 非空则启用记忆语义检索（OpenAI 兼容 `embeddings`） |
-| `CLAWMIND_MEMORY_SEMANTIC_TOP_K` | 语义检索条数，默认 8 |
-| `CLAWMIND_MAX_CONTEXT_TOKENS` | 历史消息估算 token 上限，默认 24000 |
-| `CLAWMIND_TOKEN_BUDGET` | 单次回复链路累计 token 软上限，0 不限制 |
-| `CLAWMIND_MCP_COMMAND` | MCP stdio 可执行文件（如 `npx`），空则禁用 |
-| `CLAWMIND_MCP_ARGS` | 以 `\|` 分隔的参数片段，如 `-y\|@modelcontextprotocol/server-filesystem\|/tmp` |
-| `CLAWMIND_MCP_ENV` | 额外环境变量，`KEY=VAL;KEY2=VAL2` |
-| `CLAWMIND_CODE_PROFILE` | 注入仓库画像（语言、manifest、推断命令），默认开启 |
-| `CLAWMIND_AUTO_VERIFY` | 改动后自动跑推断的测试命令，默认开启 |
-| `CLAWMIND_EVOLUTION` | 启用自进化引擎，默认 `false` |
-| `CLAWMIND_EVOLUTION_K` | 候选数 / 串行轮数，默认 3 |
-| `CLAWMIND_EVOLUTION_MODE` | `parallel`（默认）/ `sequential` / `dry` |
-| `CLAWMIND_HARNESS_DIR` | harness 根目录，默认 `.clawmind/harness` |
+Code tools (`backend/internal/tools/code.go`, executed by `backend/internal/agent/code_tools.go`):
 
-内置工具：`file_read`、`file_write`、`shell_exec`、`web_fetch`、`task_plan`、`task_summary`，以及代码工具 `code_search`、`repo_tree`、`file_edit`、`run_tests`、`load_skill`。多级内存 **L0–L3** 见 [docs/features.md](docs/features.md)；代码工作流见 [docs/code-agent.md](docs/code-agent.md)；自进化与 MCP/SSE 契约见 [docs/self-evolution.md](docs/self-evolution.md) 与 [docs/architecture-evolution.md](docs/architecture-evolution.md)。
+| Tool | Purpose | Bound |
+|------|---------|-------|
+| `code_search` | Literal or regex search, `file:line` matches | Max results (default 60); skips dependency and build dirs |
+| `repo_tree` | Repository structure | Depth 3, 240 entries |
+| `file_edit` | Exact string replacement | Fails on missing or ambiguous `old` |
+| `run_tests` | Run the inferred verification command | Restricted to `AGENT_WORKSPACE`; high-risk shell needs approval |
+| `load_skill` | Read an on-demand harness skill | Read-only, zero cost until triggered |
 
-## API 摘要
+Custom skills can be imported as OpenAI-tools JSON or created in the sidebar; they merge with `TOOLS_PATH` and the built-ins.
 
+## Self-evolution
+
+Two levels of recursion (`backend/internal/harness`, `backend/internal/evolution`):
+
+- **Task level** — one Propose–Probe–Compose–Select–Reflect step over the current harness, in `parallel`, `sequential` or `dry` mode. Selection is blind: candidates are shown under anonymized ids.
+- **Harnessing level** — a per-project experience library (`INDEX.md` + `harnesses/<slug>/EXPERIENCE.md`) with `cue`, `lesson`, `evidence`, `confidence`.
+
+Before anything is written, the whole tree is validated; a proposal that fails validation is discarded in full. Probe is a model assessment, not a real execution, so results can be `confounded` — real evidence comes from `run_tests`. Details: [docs/self-evolution.md](docs/self-evolution.md).
+
+## Configuration
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` | — | Fallback when `config.json` is empty |
+| `LISTEN` | `:8080` | HTTP listen address |
+| `DB_PATH` | `./data/clawmind.db` | SQLite path |
+| `CLAWMIND_DIR` | `.clawmind/` | `config.json`, `skills.json` |
+| `TOOLS_PATH` | `./config/tools.json` | Extra tool definitions |
+| `AGENT_WORKSPACE` | — | Root for file and shell tools |
+| `CLAWMIND_CODE_PROFILE` | `true` | Inject the repository profile |
+| `CLAWMIND_AUTO_VERIFY` | `true` | Run the inferred test command after edits |
+| `CLAWMIND_EVOLUTION` | `false` | Enable the evolution engine |
+| `CLAWMIND_EVOLUTION_K` | `3` | Candidates / sequential rounds (1–8) |
+| `CLAWMIND_EVOLUTION_MODE` | `parallel` | `parallel` · `sequential` · `dry` |
+| `CLAWMIND_HARNESS_DIR` | `.clawmind/harness` | Harness root, one subdirectory per project |
+| `CLAWMIND_MEMORY_BACKEND` | `sqlite` | `memory` = in-process, useful for tests |
+| `CLAWMIND_EMBEDDING_MODEL` | — | Enables semantic retrieval when set |
+| `CLAWMIND_MEMORY_SEMANTIC_TOP_K` | `8` | Retrieved rows |
+| `CLAWMIND_MAX_CONTEXT_TOKENS` | `24000` | History token ceiling |
+| `CLAWMIND_TOKEN_BUDGET` | `0` | Soft per-response ceiling |
+| `CLAWMIND_MCP_COMMAND` / `_ARGS` / `_ENV` | — | MCP stdio server (empty disables it) |
+
+## API
+
+- `GET /api/health`
 - `GET/PUT /api/settings` — `config.json`
-- `GET/POST /api/skills`、`POST /api/skills/import` — 技能列表与导入
- - `GET /api/harness`、`GET/POST /api/harness/file`、`POST /api/harness/round`、`GET /api/harness/rounds`、`POST /api/harness/adopt`、`POST /api/harness/lessons`、`GET /api/harness/library` — 自进化（需 `CLAWMIND_EVOLUTION=1`）
-- `POST/GET/.../api/projects`、`GET/POST/.../api/sessions`、消息与 **SSE 流式** — 详见 [docs/architecture.md](docs/architecture.md)
+- `GET/POST /api/skills`, `POST /api/skills/import`
+- `GET/POST /api/projects`, `PATCH/DELETE /api/projects/:id`
+- `GET/POST /api/sessions`, `PATCH/DELETE /api/sessions/:id`
+- `GET/POST /api/sessions/:id/messages`, `POST .../messages/:mid/regenerate`, `POST .../messages/:mid/cancel`
+- `GET /api/sessions/:id/stream` — SSE (`part_start` / `delta` / `part_end` / `tool_call` / `tool_result` / `tool_approval_request` / `done` / `error`)
+- `POST /api/sessions/:id/tool-approval`
+- Harness: `GET /api/harness`, `GET/POST /api/harness/file`, `POST /api/harness/round`, `GET /api/harness/rounds`, `POST /api/harness/adopt`, `POST /api/harness/lessons`, `GET /api/harness/library`
 
-## Docker Compose（可选）
+## Makefile
+
+```bash
+make deps            # npm ci
+make backend-build   # bin/clawmind-server (pure-Go SQLite, no CGO)
+make frontend-build  # frontend/dist
+make build           # all three
+make test            # go test ./...
+make vet             # go vet ./...
+make fmt             # gofmt -w
+make docker-up       # docker compose up --build -d
+```
+
+## Docker
 
 ```bash
 docker compose up --build
 ```
 
-浏览器访问 `http://localhost:8081`。
+Frontend on <http://localhost:8081>, backend on `:8080`, data in the `clawmind-data` volume.
 
-## 许可证
+## Docs
 
-见 [LICENSE](LICENSE)。
+| Document | Contents |
+|----------|----------|
+| [docs/code-agent.md](docs/code-agent.md) | Positioning, code tools, repository profile, verification gate |
+| [docs/self-evolution.md](docs/self-evolution.md) | Recursion levels, editable surface, validation rules, endpoints, env vars |
+| [docs/features.md](docs/features.md) | Product features, memory, UI |
+| [docs/architecture.md](docs/architecture.md) | Modules, data flow, configuration |
+| [docs/architecture-evolution.md](docs/architecture-evolution.md) | Target architecture, SSE/MCP contracts |
+| [docs/skills-roadmap.md](docs/skills-roadmap.md) | Skills roadmap |
+
+## Notes and limits
+
+- `shell_exec` runs on the host. `AGENT_WORKSPACE` narrows the blast radius, and high-risk commands require confirmation, but this is **not** a container-level sandbox.
+- Keep API keys in environment variables. `file_read` refuses to read the local config directory, and the agent is instructed not to echo secrets.
+- Evolution writes only to the editable harness surface; it cannot modify repository code.
+
+## License
+
+See [LICENSE](LICENSE).
