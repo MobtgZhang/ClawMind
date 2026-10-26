@@ -82,5 +82,20 @@ func CodeTools() []Definition {
 				},
 			},
 		},
+		{
+			Type: "function",
+			Function: FunctionSpec{
+				Name:        "delegate",
+				Description: "Run one harness subagent in its own context and return only its answer. Use for bounded investigations with large input and small output: the subagent's working context is not paid on every turn.",
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"agent": map[string]any{"type": "string", "description": "Subagent name as listed in the delegatable-subagents index"},
+						"task":  map[string]any{"type": "string", "description": "The question or task handed to the subagent"},
+					},
+					"required": []string{"agent", "task"},
+				},
+			},
+		},
 	}
 }

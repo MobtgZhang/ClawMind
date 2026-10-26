@@ -7,7 +7,7 @@ import (
 
 // Definition matches OpenAI tools JSON shape (subset).
 type Definition struct {
-	Type     string `json:"type"`
+	Type     string       `json:"type"`
 	Function FunctionSpec `json:"function"`
 }
 
