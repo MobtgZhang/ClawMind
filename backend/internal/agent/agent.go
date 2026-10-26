@@ -8,7 +8,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/mobtgzhang/clawmind/backend/internal/codectx"
 	"github.com/mobtgzhang/clawmind/backend/internal/domain"
+	"github.com/mobtgzhang/clawmind/backend/internal/harness"
 	"github.com/mobtgzhang/clawmind/backend/internal/llm"
 	"github.com/mobtgzhang/clawmind/backend/internal/memory"
 	"github.com/mobtgzhang/clawmind/backend/internal/store"
@@ -80,7 +82,21 @@ func RunStream(
 	prompts := loadPromptBundle(cfg.PromptsDir)
 	system += "\n\n" + prompts.SystemSuffix
 
-	runner := &ToolRunner{Workspace: cfg.Workspace, Client: client, MCPCall: cfg.MCPCall}
+	if cfg.Repo != nil {
+		if block := cfg.Repo.PromptBlock(4000); block != "" {
+			system += "\n\n" + block
+		}
+	}
+	if len(cfg.Harness) > 0 {
+		if block := cfg.Harness.PromptBlock(6000); block != "" {
+			system += "\n\n" + block
+		}
+	}
+	if block := harnessLessonsBlock(cfg.HarnessLessons); block != "" {
+		system += "\n\n" + block
+	}
+
+	runner := &ToolRunner{Workspace: cfg.Workspace, Client: client, Harness: cfg.Harness, MCPCall: cfg.MCPCall}
 
 	var parts []domain.Part
 
@@ -223,6 +239,7 @@ func RunStream(
 		prevToolRoundSig = toolSig
 
 		var tco []llm.ToolCallOut
+		var editedThisRound []string
 		for _, tc := range res.ToolCalls {
 			tco = append(tco, llm.ToolCallOut{
 				ID:   tc.ID,
@@ -304,7 +321,19 @@ func RunStream(
 				ToolCallID: tc.ID,
 				Content:    out,
 			})
+			if (tc.Name == "file_edit" || tc.Name == "file_write") && rerr == nil {
+				if p := toolArgPath(tc.Arguments); p != "" {
+					editedThisRound = append(editedThisRound, p)
+				}
+			}
 			_ = st.UpdateMessageParts(ctx, msg.ID, cloneParts(parts))
+		}
+
+		if gate := verifyGate(ctx, cfg, runner, editedThisRound, msg.ID, onEvent); gate != "" {
+			work = append(work, llm.ChatMessage{Role: "user", Content: gate})
+			if mem != nil {
+				_ = mem.AppendLevel(ctx, msg.SessionID, pid, 1, "verification", truncateRunes(gate, 800))
+			}
 		}
 	}
 
@@ -385,6 +414,27 @@ func cloneParts(p []domain.Part) []domain.Part {
 	out := make([]domain.Part, len(p))
 	copy(out, p)
 	return out
+}
+
+// harnessLessonsBlock renders transferable lessons from the experience library. The library is
+// data about past runs, so it is presented as prior experience rather than rules to obey.
+func harnessLessonsBlock(lessons []domain.HarnessLesson) string {
+	if len(lessons) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("## 经验库（本项目此前被采纳的教训）\n\n")
+	for _, l := range lessons {
+		if b.Len() > 2400 {
+			break
+		}
+		confidence := strings.TrimSpace(l.Confidence)
+		if confidence == "" {
+			confidence = "low"
+		}
+		b.WriteString("- " + l.Cue + " → " + l.Lesson + "（" + confidence + "）\n")
+	}
+	return strings.TrimSpace(b.String())
 }
 
 func lastUserText(msgs []domain.Message) string {
@@ -488,6 +538,14 @@ type RunConfig struct {
 	TokenBudget      int // <=0: no cap on accumulated completion usage per RunStream
 	Workspace        string
 	ToolsJSON        json.RawMessage // JSON array of OpenAI tool defs
+	// Repo is the code workspace profile: languages, manifests and inferred commands.
+	Repo *codectx.Profile
+	// Harness is the editable component surface injected into the system prompt.
+	Harness harness.Tree
+	// HarnessLessons are transferable lessons read from the experience library.
+	HarnessLessons []domain.HarnessLesson
+	// AutoVerify runs the inferred verification command after edits and feeds the result back.
+	AutoVerify        bool
 	WaitShellApproval func(context.Context, ShellApprovalRequest) (bool, error)
 	MCPCall           func(context.Context, string, string) (string, error)
 }

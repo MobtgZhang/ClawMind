@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/mobtgzhang/clawmind/backend/internal/harness"
 	"github.com/mobtgzhang/clawmind/backend/internal/llm"
 	"github.com/mobtgzhang/clawmind/backend/internal/security"
 )
@@ -21,6 +22,8 @@ import (
 type ToolRunner struct {
 	Workspace string
 	Client    llm.Provider
+	// Harness is the editable component surface: skills are loaded on demand through load_skill.
+	Harness harness.Tree
 	// MCPCall handles tools not implemented locally (e.g. MCP server).
 	MCPCall func(ctx context.Context, name string, argsJSON string) (string, error)
 }
@@ -180,6 +183,22 @@ func (r *ToolRunner) Run(ctx context.Context, name, argsJSON string, cfg RunConf
 		return r.llmText(ctx, cfg,
 			"将用户给出的文本总结为 3～6 条中文要点（Markdown 列表），不要开场白。",
 			body)
+	case "code_search":
+		return r.codeSearch(ctx, argsJSON)
+	case "repo_tree":
+		return r.repoTree(argsJSON)
+	case "file_edit":
+		return r.fileEdit(argsJSON)
+	case "run_tests":
+		return r.runTests(ctx, argsJSON, cfg.Repo)
+	case "load_skill":
+		var a struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
+			return "", err
+		}
+		return r.loadSkill(a.Name)
 	default:
 		if r.MCPCall != nil {
 			return r.MCPCall(ctx, name, argsJSON)
