@@ -2,7 +2,7 @@
 
 ## 产品定位
 
-ClawMind 是面向开发者的 **本地优先** AI 对话客户端：单仓库内 **Go 后端** + **Vue 3 前端**，支持流式回复、会话与项目管理，以及可扩展的 **工具型 Agent**。
+ClawMind 是面向开发者的 **本地优先** 代码项目 Agent：单仓库内 **Go 后端** + **Vue 3 前端**，支持流式回复、会话与项目管理，以及**代码工具型 Agent** 与**自进化 harness**。定位是代码任务，不做通用任务助手。
 
 ## 核心特性
 
@@ -19,10 +19,18 @@ ClawMind 是面向开发者的 **本地优先** AI 对话客户端：单仓库�
 - **`.clawmind/config.json`**：模型地址、API Key、采样参数、`maxAgentRounds` 等；**打开设置** 与 **发起对话** 均读取该文件。
 - 支持环境变量后备（如 `OPENAI_API_KEY`、`OPENAI_BASE_URL`）；**推荐用环境变量存放 API Key**，减少配置文件被工具误读的风险。
 
-### 自进化 Agent 与工具
+### 代码工具与自进化
 
 - **非流式工具轮**：在流式最终回答前，可多次调用模型进行 **function calling**，执行后再继续。
 - **内置原子工具**：`file_read`、`file_write`、`shell_exec`（Windows / macOS / Linux 差异由后端处理）、`web_fetch`、`task_plan`、`task_summary`。
+
+**代码向工具**（`backend/internal/tools/code.go`）：`code_search`（有边界的字面量/正则搜索）、`repo_tree`（有界结构，跳过依赖与构建目录）、`file_edit`（精确替换，`old` 歧义即失败）、`run_tests`（跑推断出的验证命令）、`load_skill`（按需读取 harness 技能）。
+
+**仓库画像**：`internal/codectx` 扫描语言、manifest、推断的 test/build/lint/format 命令与有界目录树，注入系统提示；不 shell out。
+
+**改后必验证**：某一轮发生文件改动后自动跑推断的测试命令，输出回灌进对话，失败必须被读而不是被忽略（`CLAWMIND_AUTO_VERIFY`）。
+
+**自进化 harness**：两级递归（任务级 Propose–Probe–Compose–Select–Reflect + 经验级经验库），可编辑面只有 `AGENTS.md`、`tool_guidance.md`、`lessons.md`、`skills/`、`scripts/`；写入前整树校验，证据不足时保留基线。侧栏 Harness 面板可查看与运行。详见 [自进化](self-evolution.md)。
 - **工作目录**：`AGENT_WORKSPACE` 限制文件与 Shell 的相对路径根，降低误操作范围。
 - **高危 Shell**：匹配启发式危险模式时，经 SSE 推送确认请求，用户通过 REST 批准或拒绝后再执行（非沙箱，仍需谨慎）。
 - **web_fetch**：对目标 URL 做 SSRF 过滤，禁止访问内网与链路本地等地址。

@@ -4,6 +4,8 @@
 
 | 文档 | 说明 |
 |------|------|
+| [代码项目助手](code-agent.md) | 定位收窄：代码工具、仓库画像、改后必验证 |
+| [自进化](self-evolution.md) | Harness 两级递归、可编辑面、校验规则、API 与环境变量 |
 | [特点与能力](features.md) | 产品特性、Agent、工具、记忆与界面 |
 | [架构说明](architecture.md) | 技术栈、模块划分、数据流与配置 |
 | [演进架构与路线图](architecture-evolution.md) | 相对 content1 的差距、目标架构、SSE/MCP 契约与环境变量 |

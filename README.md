@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <strong>本地优先的 AI 对话与 Agent 客户端</strong><br/>
+  <strong>本地优先的代码项目 Agent</strong><br/>
   Go（Gin + SQLite + SSE）· Vue 3（Vite + Pinia + Tailwind）
 </p>
 
@@ -19,9 +19,9 @@
 
 ## 简介
 
-ClawMind 提供 **ChatGPT 风格主列**（主区宽度约为侧栏以外区域的 **4/5 / 80%**）、**流式 Markdown**（含表格与代码块复制）、**可折叠的任务流程与思考过程**（Cursor Agent 式分段）、**内置工具 Agent** 与 **项目 / 技能 / 会话** 管理。模型与密钥等保存在 **`.clawmind/config.json`**，也可用环境变量作后备。
+ClawMind 定位在**真实代码仓库**里工作：先定位、再改动、改后必验证。它提供 **ChatGPT 风格主列**（主区宽度约为侧栏以外区域的 **4/5 / 80%**）、**流式 Markdown**（含表格与代码块复制）、**可折叠的任务流程与思考过程**（Cursor Agent 式分段）、**代码工具 Agent**（搜索 / 结构 / 精确编辑 / 跑测试）与 **项目 / 技能 / 会话** 管理，并额外提供**自进化 harness**（agent 只能改自己的工作方式，不能改仓库代码）。模型与密钥等保存在 **`.clawmind/config.json`**，也可用环境变量作后备。
 
-**详细文档**见 **[docs/](docs/README.md)**（[特点与能力](docs/features.md)、[架构说明](docs/architecture.md)）。
+**详细文档**见 **[docs/](docs/README.md)**（[代码项目助手](docs/code-agent.md)、[自进化](docs/self-evolution.md)、[特点与能力](docs/features.md)、[架构说明](docs/architecture.md)）。
 
 ## 前置条件
 
@@ -80,13 +80,20 @@ npm install && npm run dev
 | `CLAWMIND_MCP_COMMAND` | MCP stdio 可执行文件（如 `npx`），空则禁用 |
 | `CLAWMIND_MCP_ARGS` | 以 `\|` 分隔的参数片段，如 `-y\|@modelcontextprotocol/server-filesystem\|/tmp` |
 | `CLAWMIND_MCP_ENV` | 额外环境变量，`KEY=VAL;KEY2=VAL2` |
+| `CLAWMIND_CODE_PROFILE` | 注入仓库画像（语言、manifest、推断命令），默认开启 |
+| `CLAWMIND_AUTO_VERIFY` | 改动后自动跑推断的测试命令，默认开启 |
+| `CLAWMIND_EVOLUTION` | 启用自进化引擎，默认 `false` |
+| `CLAWMIND_EVOLUTION_K` | 候选数 / 串行轮数，默认 3 |
+| `CLAWMIND_EVOLUTION_MODE` | `parallel`（默认）/ `sequential` / `dry` |
+| `CLAWMIND_HARNESS_DIR` | harness 根目录，默认 `.clawmind/harness` |
 
-内置工具：`file_read`、`file_write`、`shell_exec`、`web_fetch`、`task_plan`、`task_summary`。多级内存 **L0–L3** 见 [docs/features.md](docs/features.md)；演进与 MCP/SSE 契约见 [docs/architecture-evolution.md](docs/architecture-evolution.md)。
+内置工具：`file_read`、`file_write`、`shell_exec`、`web_fetch`、`task_plan`、`task_summary`，以及代码工具 `code_search`、`repo_tree`、`file_edit`、`run_tests`、`load_skill`。多级内存 **L0–L3** 见 [docs/features.md](docs/features.md)；代码工作流见 [docs/code-agent.md](docs/code-agent.md)；自进化与 MCP/SSE 契约见 [docs/self-evolution.md](docs/self-evolution.md) 与 [docs/architecture-evolution.md](docs/architecture-evolution.md)。
 
 ## API 摘要
 
 - `GET/PUT /api/settings` — `config.json`
 - `GET/POST /api/skills`、`POST /api/skills/import` — 技能列表与导入
+ - `GET /api/harness`、`GET/POST /api/harness/file`、`POST /api/harness/round`、`GET /api/harness/rounds`、`POST /api/harness/adopt`、`POST /api/harness/lessons`、`GET /api/harness/library` — 自进化（需 `CLAWMIND_EVOLUTION=1`）
 - `POST/GET/.../api/projects`、`GET/POST/.../api/sessions`、消息与 **SSE 流式** — 详见 [docs/architecture.md](docs/architecture.md)
 
 ## Docker Compose（可选）
