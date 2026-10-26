@@ -13,6 +13,7 @@ import (
 	"github.com/mobtgzhang/clawmind/backend/internal/harness"
 	"github.com/mobtgzhang/clawmind/backend/internal/llm"
 	"github.com/mobtgzhang/clawmind/backend/internal/memory"
+	"github.com/mobtgzhang/clawmind/backend/internal/security"
 	"github.com/mobtgzhang/clawmind/backend/internal/store"
 	"github.com/mobtgzhang/clawmind/backend/internal/thread"
 )
@@ -24,6 +25,12 @@ type MessageUpdater interface {
 	UpdateMessageParts(ctx context.Context, id string, parts []domain.Part) error
 	TouchSession(ctx context.Context, id string) error
 	GetSession(ctx context.Context, id string) (*domain.Session, error)
+}
+
+// Observer is the memory distiller seam. The raw turn is stored as L0 and the higher layers are
+// built off the turn; without it the agent writes the layers itself, which is the fallback path.
+type Observer interface {
+	Observe(ctx context.Context, sessionID, projectID, text string) error
 }
 
 // RunStream generates assistant content with task → thinking → tools → streamed answer.
@@ -61,8 +68,20 @@ func RunStream(
 			upto = append(upto, m)
 		}
 	}
-	upto = TrimHistoryByAssistantRounds(upto, cfg.MaxAgentRounds)
-	upto = TrimHistoryByEstimatedTokens(upto, cfg.MaxContextTokens)
+	runner := &ToolRunner{Workspace: cfg.Workspace, Client: client, Harness: cfg.Harness, MCPCall: cfg.MCPCall, Policy: cfg.ShellPolicy}
+	runner.Hooks = cfg.Hooks
+	var parts []domain.Part
+
+	kept := TrimHistoryByAssistantRounds(upto, cfg.MaxAgentRounds)
+	kept = TrimHistoryByEstimatedTokens(kept, cfg.MaxContextTokens)
+	// PostCompact only fires when context was actually dropped. A hook that watches compaction has
+	// to be told when it happened; otherwise the event is a promise the runtime never keeps.
+	if cfg.Hooks != nil && len(kept) < len(upto) {
+		if _, err := runner.fireHooks(ctx, "PostCompact", cfg, "", map[string]any{"droppedMessages": len(upto) - len(kept)}, ""); err != nil {
+			return stopTurn(ctx, st, msg, &parts, onEvent, "PostCompact", err)
+		}
+		upto = kept
+	}
 
 	lastUser := lastUserText(upto)
 	pid := ""
@@ -95,10 +114,37 @@ func RunStream(
 	if block := harnessLessonsBlock(cfg.HarnessLessons); block != "" {
 		system += "\n\n" + block
 	}
+	if block := loadoutBlock(cfg.Loadout); block != "" {
+		system += "\n\n" + block
+	}
 
-	runner := &ToolRunner{Workspace: cfg.Workspace, Client: client, Harness: cfg.Harness, MCPCall: cfg.MCPCall}
+	// Stop fires on every exit path, including a cancelled or failed turn: a hook that watches the
+	// end of a run has to see the run end, not only the successful branch.
+	defer func() {
+		if cfg.Hooks == nil {
+			return
+		}
+		_, _ = runner.fireHooks(ctx, "Stop", cfg, "", map[string]any{"answer": lastAnswerText(parts)}, "")
+	}()
 
-	var parts []domain.Part
+	// Context-level hooks inject guidance into the system prompt. A veto here stops the turn before
+	// any model call is paid for, which is the point of a pre-turn hook.
+	if cfg.Hooks != nil {
+		guidance, herr := runner.fireHooks(ctx, "SessionStart", cfg, "", nil, "")
+		if herr != nil {
+			return stopTurn(ctx, st, msg, &parts, onEvent, "SessionStart", herr)
+		}
+		if guidance != "" {
+			system += "\n\nhook 注入（SessionStart）：\n" + guidance
+		}
+		guidance, herr = runner.fireHooks(ctx, "UserPromptSubmit", cfg, "", map[string]any{"prompt": lastUser}, lastUser)
+		if herr != nil {
+			return stopTurn(ctx, st, msg, &parts, onEvent, "UserPromptSubmit", herr)
+		}
+		if guidance != "" {
+			system += "\n\nhook 注入（UserPromptSubmit）：\n" + guidance
+		}
+	}
 
 	emitStartIdx := func(pt domain.PartType, idx int) error {
 		return onEvent(domain.StreamEvent{Type: domain.EventPartStart, MessageID: msg.ID, PartIndex: idx, PartType: pt})
@@ -209,7 +255,7 @@ func RunStream(
 				_ = st.UpdateMessageParts(ctx, msg.ID, cloneParts(parts))
 				_ = onEvent(domain.StreamEvent{Type: domain.EventDone, MessageID: msg.ID})
 				_ = st.TouchSession(ctx, msg.SessionID)
-				appendMemoryAfterTurn(mem, ctx, msg.SessionID, pid, lastUser, res.Content)
+				appendMemoryAfterTurn(mem, ctx, msg.SessionID, pid, lastUser, res.Content, cfg.Observer)
 				return nil
 			}
 			break
@@ -264,10 +310,16 @@ func RunStream(
 			var rerr error
 			if tc.Name == "shell_exec" {
 				cmd := ShellCommandFromArgs(tc.Arguments)
-				if ShellCommandDenied(cmd) {
+				policy := runner.policy()
+				if policy.CommandDenied(cmd) {
 					out = "错误: 该命令被安全策略禁止执行（命中 shell denylist）。"
 				}
-				if out == "" && ShellRiskHigh(cmd) && cfg.WaitShellApproval != nil {
+				// A plugin layer that turns approval off means high-risk commands are refused rather
+				// than prompted: the layer is a policy, not a suggestion the agent can decline.
+				if out == "" && policy.CommandHighRisk(cmd) && !policy.AllowApproval {
+					out = "错误: 该命令属于高风险且沙箱策略关闭了人工确认。"
+				}
+				if out == "" && policy.CommandHighRisk(cmd) && cfg.WaitShellApproval != nil {
 					ok, aerr := cfg.WaitShellApproval(ctx, ShellApprovalRequest{
 						SessionID:      cfg.SessionID,
 						MessageID:      msg.ID,
@@ -382,18 +434,26 @@ func RunStream(
 	_ = st.TouchSession(ctx, msg.SessionID)
 
 	if mem != nil && acc.Len() > 0 {
-		appendMemoryAfterTurn(mem, ctx, msg.SessionID, pid, lastUser, acc.String())
+		appendMemoryAfterTurn(mem, ctx, msg.SessionID, pid, lastUser, acc.String(), cfg.Observer)
 	}
 	return nil
 }
 
-func appendMemoryAfterTurn(mem memory.Store, ctx context.Context, sessionID, projectID, lastUser, fullText string) {
+// appendMemoryAfterTurn records one turn. With a distiller the raw text goes to L0 and the higher
+// layers are built off the turn; without one the agent writes the layers itself, which is the
+// fallback path that keeps memory usable when no model is configured.
+func appendMemoryAfterTurn(mem memory.Store, ctx context.Context, sessionID, projectID, lastUser, fullText string, obs Observer) {
 	if mem == nil {
 		return
 	}
 	summary := strings.TrimSpace(fullText)
 	if len(summary) > 400 {
 		summary = summary[:400] + "…"
+	}
+	if obs != nil {
+		if err := obs.Observe(ctx, sessionID, projectID, fullText); err == nil {
+			return
+		}
 	}
 	if summary != "" {
 		_ = mem.AppendLevel(ctx, sessionID, projectID, 1, "turn", summary)
@@ -523,17 +583,19 @@ func streamPhaseMarkdown(
 type RunConfig struct {
 	AssistantMessageID string
 	SessionID          string
-	BaseURL            string
-	APIKey             string
-	Model              string
-	SystemPrompt       string
+	// ProjectID is the scope the harness, memory and hooks are resolved against.
+	ProjectID    string
+	BaseURL      string
+	APIKey       string
+	Model        string
+	SystemPrompt string
 	// PromptsDir is the directory containing system_suffix.md, task_flow_user.md, thinking_user.md.
 	// Empty: auto-resolve backend/data/prompts from cwd; missing files use built-in defaults.
-	PromptsDir     string
-	Temperature    float64
-	TopP           float64
-	TopK           *int
-	MaxAgentRounds int
+	PromptsDir       string
+	Temperature      float64
+	TopP             float64
+	TopK             *int
+	MaxAgentRounds   int
 	MaxContextTokens int // <=0: skip token-based history trim
 	TokenBudget      int // <=0: no cap on accumulated completion usage per RunStream
 	Workspace        string
@@ -544,10 +606,18 @@ type RunConfig struct {
 	Harness harness.Tree
 	// HarnessLessons are transferable lessons read from the experience library.
 	HarnessLessons []domain.HarnessLesson
+	// Loadout is the asset set bound to this agent by the memory asset registry.
+	Loadout []memory.Asset
 	// AutoVerify runs the inferred verification command after edits and feeds the result back.
 	AutoVerify        bool
 	WaitShellApproval func(context.Context, ShellApprovalRequest) (bool, error)
 	MCPCall           func(context.Context, string, string) (string, error)
+	// Hooks is the plugin dispatcher; nil means no mounted plugin registered a hook.
+	Hooks HookSink
+	// ShellPolicy is the sandbox layer resolved from the plugin registry; nil means the built-in floor.
+	ShellPolicy *security.Policy
+	// Observer distils memory layers from the turn. nil falls back to direct layer writes.
+	Observer Observer
 }
 
 func reflexionAppend(
@@ -566,9 +636,9 @@ func reflexionAppend(
 		snippet = snippet[:800] + "…"
 	}
 	ref, err := client.Complete(ctx, llm.CompleteParams{
-		BaseURL:     cfg.BaseURL,
-		APIKey:      cfg.APIKey,
-		Model:       cfg.Model,
+		BaseURL: cfg.BaseURL,
+		APIKey:  cfg.APIKey,
+		Model:   cfg.Model,
 		Messages: []llm.ChatMessage{
 			{Role: "system", Content: "用 2～4 句中文简要说明上一轮工具失败或异常的可能原因与下一步建议。不要调用工具。"},
 			{Role: "user", Content: "工具名: " + tc.Name + "\n输出:\n" + snippet},

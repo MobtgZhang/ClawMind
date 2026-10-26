@@ -26,6 +26,14 @@ type ToolRunner struct {
 	Harness harness.Tree
 	// MCPCall handles tools not implemented locally (e.g. MCP server).
 	MCPCall func(ctx context.Context, name string, argsJSON string) (string, error)
+	// Hooks is the plugin dispatcher. nil means no plugin mounted a hook.
+	Hooks HookSink
+	// Policy is the sandbox layer resolved from the plugin registry. nil means the built-in floor.
+	Policy *security.Policy
+}
+
+func (r *ToolRunner) policy() security.Policy {
+	return ShellPolicy(r.Policy)
 }
 
 func (r *ToolRunner) safePath(rel string) (string, error) {
@@ -51,8 +59,9 @@ func (r *ToolRunner) safePath(rel string) (string, error) {
 	return "", fmt.Errorf("path escapes workspace")
 }
 
-// Run executes one tool by name and JSON arguments.
-func (r *ToolRunner) Run(ctx context.Context, name, argsJSON string, cfg RunConfig) (string, error) {
+// runTool executes one tool by name and JSON arguments. Hooks are fired by Run around it, so the
+// tool body stays free of hook logic.
+func (r *ToolRunner) runTool(ctx context.Context, name, argsJSON string, cfg RunConfig) (string, error) {
 	switch name {
 	case "file_read":
 		var a struct {
@@ -109,7 +118,17 @@ func (r *ToolRunner) Run(ctx context.Context, name, argsJSON string, cfg RunConf
 		if cmd == "" {
 			return "", fmt.Errorf("empty command")
 		}
-		cctx, cancel := context.WithTimeout(ctx, ShellExecTimeout)
+		policy := r.policy()
+		if policy.CommandDenied(cmd) {
+			return "", fmt.Errorf("shell_exec: command is denied by the security policy")
+		}
+		// The layer may shorten the timeout but never extend it, so a plugin cannot turn a bounded
+		// subprocess into an unbounded one.
+		limit := ShellExecTimeout
+		if policy.ShellTimeout > 0 && policy.ShellTimeout < limit {
+			limit = policy.ShellTimeout
+		}
+		cctx, cancel := context.WithTimeout(ctx, limit)
 		defer cancel()
 		var c *exec.Cmd
 		if runtime.GOOS == "windows" {
@@ -199,6 +218,15 @@ func (r *ToolRunner) Run(ctx context.Context, name, argsJSON string, cfg RunConf
 			return "", err
 		}
 		return r.loadSkill(a.Name)
+	case "delegate":
+		var a struct {
+			Agent string `json:"agent"`
+			Task  string `json:"task"`
+		}
+		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
+			return "", err
+		}
+		return r.delegate(ctx, a.Agent, a.Task, cfg)
 	default:
 		if r.MCPCall != nil {
 			return r.MCPCall(ctx, name, argsJSON)
