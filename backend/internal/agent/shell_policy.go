@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"time"
+
+	"github.com/mobtgzhang/clawmind/backend/internal/security"
 )
 
 // ShellExecTimeout is the maximum wall time for a single shell_exec subprocess.
@@ -21,56 +23,21 @@ type ShellApprovalRequest struct {
 
 // ShellCommandDenied reports commands that are never executed, even if the user approves a high-risk prompt.
 func ShellCommandDenied(command string) bool {
-	c := strings.TrimSpace(strings.ToLower(command))
-	if c == "" {
-		return false
-	}
-	// Block obvious host-wide destruction and fork bombs.
-	if strings.Contains(c, ":(){") || strings.Contains(c, ": (){") {
-		return true
-	}
-	if strings.Contains(c, "rm -rf /") || strings.Contains(c, "rm -fr /") ||
-		strings.Contains(c, "rm -rf /*") || strings.Contains(c, "rm -fr /*") {
-		return true
-	}
-	if strings.Contains(c, "> /dev/sd") || strings.Contains(c, "of=/dev/sd") {
-		return true
-	}
-	if strings.Contains(c, "/dev/tcp/") && strings.Contains(c, "bash") {
-		return true
-	}
-	return false
+	return security.CommandDenied(command)
 }
 
 // ShellRiskHigh reports whether the command should require explicit user approval.
 func ShellRiskHigh(command string) bool {
-	c := strings.TrimSpace(strings.ToLower(command))
-	if c == "" {
-		return false
+	return security.CommandHighRisk(command)
+}
+
+// ShellPolicy returns the policy a runner applies. A nil policy is the built-in floor: a plugin
+// layer can add patterns to it, so an unset layer never weakens the check.
+func ShellPolicy(p *security.Policy) security.Policy {
+	if p == nil {
+		return security.DefaultPolicy()
 	}
-	if ShellCommandDenied(c) {
-		return true
-	}
-	// Destructive / network / privilege patterns (heuristic, not exhaustive).
-	patterns := []string{
-		"rm ", "rm\t", "rmdir", "mkfs", "dd ", "> /dev/", "chmod 777",
-		"curl ", "wget ", "nc ", "netcat", "ssh ", "scp ",
-		"sudo ", "su ", "chown ", "chmod +s",
-		"docker ", "kubectl ",
-		"apt-get", "apt install", "yum install", "dnf install",
-		"powershell", "format ",
-		"systemctl ", "mount ", "umount ", "iptables ", "firewall-cmd",
-		"crontab ", "at ", "launchctl ",
-	}
-	for _, p := range patterns {
-		if strings.Contains(c, p) {
-			return true
-		}
-	}
-	if strings.Contains(c, "|") && (strings.Contains(c, "curl") || strings.Contains(c, "wget")) {
-		return true
-	}
-	return false
+	return security.ResolvePolicy(*p)
 }
 
 // ShellCommandFromArgs parses shell_exec JSON arguments for the command string.
