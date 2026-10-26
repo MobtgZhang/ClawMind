@@ -40,6 +40,10 @@ export interface ServerSettings {
   topP: number;
   topK?: number;
   maxAgentRounds: number;
+  /** 运行时真正使用的值：插件层可以覆盖文件配置，保存仍然写的是文件。 */
+  effective?: Record<string, unknown>;
+  /** 哪个插件赢了某个 key；没有条目表示这个值来自文件或环境变量。 */
+  source?: Record<string, string>;
 }
 
 export interface Session {

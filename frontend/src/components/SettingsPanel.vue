@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { reactive, watch } from "vue";
+import { computed, reactive, watch } from "vue";
 import { useChatStore } from "@/stores/chat";
 import { SAMPLING_PRESETS } from "@/types/chat";
 
@@ -16,6 +16,16 @@ const form = reactive({
   topP: 1,
   topK: 0 as number,
   maxAgentRounds: 16,
+});
+
+/** Keys the plugin layer wins. The form edits the file, so these are shown as overrides rather than
+merged into the inputs: saving here would not change what the runtime uses. */
+const overrides = computed(() => {
+  const source = store.serverSettings.source ?? {};
+  const effective = store.serverSettings.effective ?? {};
+  return Object.keys(source)
+    .sort()
+    .map((key) => ({ key, plugin: source[key], value: String(effective[key] ?? "") }));
 });
 
 function syncFromStore() {
@@ -77,6 +87,19 @@ async function onSave() {
           <code class="rounded bg-surface-muted px-1">CLAWMIND_DIR</code> 指定目录）。未填 API Key 时仍可使用
           <code class="rounded bg-surface-muted px-1">OPENAI_API_KEY</code> 等环境变量作为后备。
         </p>
+
+        <div
+          v-if="overrides.length"
+          class="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-ink"
+        >
+          <p class="font-medium">这些 key 由插件层决定，设置页保存的只是文件配置</p>
+          <ul class="mt-1 list-disc pl-4 text-ink-muted">
+            <li v-for="row in overrides" :key="row.key">
+              <code class="rounded bg-surface px-1">{{ row.key }}</code> → 插件
+              <code class="rounded bg-surface px-1">{{ row.plugin }}</code>（生效值 {{ row.value }}）
+            </li>
+          </ul>
+        </div>
 
         <h3 class="mt-5 text-sm font-semibold text-ink">模型与鉴权</h3>
         <label class="mt-2 block text-xs font-medium text-ink-muted">API Base URL</label>
