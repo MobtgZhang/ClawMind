@@ -10,14 +10,14 @@ import (
 
 // Config is persisted as .clawmind/config.json (camelCase JSON).
 type Config struct {
-	OpenAIBaseURL   string   `json:"openaiBaseUrl"`
-	OpenAIAPIKey    string   `json:"openaiApiKey"`
-	OpenAIModel     string   `json:"openaiModel"`
-	SystemPrompt    string   `json:"systemPrompt"`
-	Temperature     float64  `json:"temperature"`
-	TopP            float64  `json:"topP"`
-	TopK            *int     `json:"topK,omitempty"`
-	MaxAgentRounds  int      `json:"maxAgentRounds"`
+	OpenAIBaseURL  string  `json:"openaiBaseUrl"`
+	OpenAIAPIKey   string  `json:"openaiApiKey"`
+	OpenAIModel    string  `json:"openaiModel"`
+	SystemPrompt   string  `json:"systemPrompt"`
+	Temperature    float64 `json:"temperature"`
+	TopP           float64 `json:"topP"`
+	TopK           *int    `json:"topK,omitempty"`
+	MaxAgentRounds int     `json:"maxAgentRounds"`
 }
 
 // Resolved merges file config with environment fallbacks for API calls.

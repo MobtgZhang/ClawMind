@@ -18,12 +18,12 @@ import (
 
 // Session is a connected MCP subprocess with cached tool definitions.
 type Session struct {
-	cmd   *exec.Cmd
-	stdin io.WriteCloser
-	mu    sync.Mutex
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	mu     sync.Mutex
 	nextID int64
-	pend  map[string]chan rpcEnvelope
-	tools []tools.Definition
+	pend   map[string]chan rpcEnvelope
+	tools  []tools.Definition
 }
 
 type rpcEnvelope struct {

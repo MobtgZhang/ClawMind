@@ -81,7 +81,7 @@ type streamResponseLine struct {
 		Delta struct {
 			Content   string `json:"content"`
 			ToolCalls []struct {
-				Index    int `json:"index"`
+				Index    int    `json:"index"`
 				ID       string `json:"id"`
 				Type     string `json:"type"`
 				Function struct {
