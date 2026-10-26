@@ -8,7 +8,7 @@ const skillsOpen = ref(true);
 const chatsOpen = ref(true);
 const skillFileInput = ref<HTMLInputElement | null>(null);
 
-defineEmits<{ (e: "open-settings"): void }>();
+defineEmits<{ (e: "open-settings"): void; (e: "open-harness"): void }>();
 
 function onNewProject() {
   const t = window.prompt("项目名称", "新项目");
@@ -222,6 +222,18 @@ function onNewSkill() {
 
     <div class="border-t border-ink/10 p-2">
       <div class="flex w-full items-center justify-between px-1">
+        <button
+          type="button"
+          class="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-ink-muted transition hover:bg-ink/10 hover:text-ink"
+          title="Harness（自进化）"
+          aria-label="Harness（自进化）"
+          @click="$emit('open-harness')"
+        >
+          <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M12 3v18" />
+            <path stroke-linecap="round" stroke-linejoin="round" d="M12 8l4-4M12 8L8 4M12 16l4 4M12 16l-4 4" />
+          </svg>
+        </button>
         <button
           type="button"
           class="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-ink-muted transition hover:bg-ink/10 hover:text-ink"

@@ -4,10 +4,12 @@ import Sidebar from "./components/Sidebar.vue";
 import ChatMessage from "./components/ChatMessage.vue";
 import Composer from "./components/Composer.vue";
 import SettingsPanel from "./components/SettingsPanel.vue";
+import HarnessPanel from "./components/HarnessPanel.vue";
 import { useChatStore } from "./stores/chat";
 
 const store = useChatStore();
 const settingsOpen = ref(false);
+const harnessOpen = ref(false);
 const listRef = ref<HTMLElement | null>(null);
 
 onMounted(() => {
@@ -17,7 +19,7 @@ onMounted(() => {
 
 <template>
   <div class="flex h-full overflow-hidden">
-    <Sidebar @open-settings="settingsOpen = true" />
+    <Sidebar @open-settings="settingsOpen = true" @open-harness="harnessOpen = true" />
     <main class="flex min-w-0 flex-1 flex-col">
       <header
         class="flex h-12 shrink-0 items-center justify-center border-b border-ink/10 px-3 md:px-4"
@@ -63,5 +65,6 @@ onMounted(() => {
       <Composer />
     </main>
     <SettingsPanel v-model:open="settingsOpen" />
+    <HarnessPanel v-model:open="harnessOpen" />
   </div>
 </template>
