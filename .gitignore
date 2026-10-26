@@ -44,6 +44,9 @@ bin/
 # 本地临时脚本（不上传）
 push.sh
 
+# 本地生成的报告与规划稿（不上传）
+reports/
+
 # Editor/IDE
 # .idea/
 # .vscode/
