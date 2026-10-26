@@ -105,6 +105,55 @@ func (s *Store) migrate() error {
 			return err
 		}
 	}
+	return s.migrateHarness()
+}
+
+// migrateHarness creates the self-evolution tables (rounds, edit rows, lessons).
+func (s *Store) migrateHarness() error {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS harness_rounds (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL DEFAULT '',
+  mode TEXT NOT NULL,
+  k INTEGER NOT NULL,
+  adopted TEXT NOT NULL DEFAULT '',
+  kept_base INTEGER NOT NULL DEFAULT 0,
+  notes TEXT NOT NULL DEFAULT '',
+  inventory TEXT NOT NULL DEFAULT '',
+  always_on INTEGER NOT NULL DEFAULT 0,
+  errors_json TEXT NOT NULL DEFAULT '[]',
+  created_at INTEGER NOT NULL
+);`,
+		`CREATE INDEX IF NOT EXISTS idx_harness_rounds_project_time ON harness_rounds(project_id, created_at);`,
+		`CREATE TABLE IF NOT EXISTS harness_edits (
+  id TEXT PRIMARY KEY,
+  round_id TEXT NOT NULL REFERENCES harness_rounds(id) ON DELETE CASCADE,
+  component TEXT NOT NULL,
+  candidates TEXT NOT NULL DEFAULT '',
+  change TEXT NOT NULL,
+  observed TEXT NOT NULL DEFAULT '',
+  verdict TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);`,
+		`CREATE INDEX IF NOT EXISTS idx_harness_edits_round ON harness_edits(round_id, created_at);`,
+		`CREATE TABLE IF NOT EXISTS harness_lessons (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL DEFAULT '',
+  round_id TEXT,
+  cue TEXT NOT NULL,
+  lesson TEXT NOT NULL,
+  evidence TEXT NOT NULL DEFAULT '',
+  confidence TEXT NOT NULL DEFAULT 'low',
+  created_at INTEGER NOT NULL
+);`,
+		`CREATE INDEX IF NOT EXISTS idx_harness_lessons_project_time ON harness_lessons(project_id, created_at);`,
+	}
+	for _, q := range stmts {
+		if _, err := s.db.Exec(q); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
