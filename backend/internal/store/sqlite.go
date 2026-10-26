@@ -154,7 +154,92 @@ func (s *Store) migrateHarness() error {
 			return err
 		}
 	}
+	// Rounds recorded before the ledger existed have no task/runmark columns; adding them keeps
+	// old databases readable instead of forcing a fresh file.
+	for _, col := range []struct{ name, def string }{
+		{"task_id", "TEXT NOT NULL DEFAULT ''"},
+		{"runmark", "TEXT NOT NULL DEFAULT ''"},
+		{"ledger_r", "INTEGER NOT NULL DEFAULT 0"},
+		{"ledger_p", "INTEGER NOT NULL DEFAULT 0"},
+		{"measured_r", "INTEGER NOT NULL DEFAULT 0"},
+		{"pool_json", "TEXT NOT NULL DEFAULT '[]'"},
+		{"dropped_json", "TEXT NOT NULL DEFAULT '[]'"},
+		{"cached", "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		if err := s.ensureColumn("harness_rounds", col.name, col.def); err != nil {
+			return err
+		}
+	}
+	budgetStmts := []string{
+		`CREATE TABLE IF NOT EXISTS harness_ledger (
+  id TEXT PRIMARY KEY,
+  round_id TEXT NOT NULL REFERENCES harness_rounds(id) ON DELETE CASCADE,
+  mode TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  k INTEGER NOT NULL,
+  r INTEGER NOT NULL DEFAULT 0,
+  p INTEGER NOT NULL DEFAULT 0,
+  measured_r INTEGER NOT NULL DEFAULT 0,
+  entries_json TEXT NOT NULL DEFAULT '[]',
+  created_at INTEGER NOT NULL
+);`,
+		`CREATE INDEX IF NOT EXISTS idx_harness_ledger_round ON harness_ledger(round_id, created_at);`,
+		`CREATE TABLE IF NOT EXISTS harness_runmarks (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  harness_hash TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  k INTEGER NOT NULL,
+  round_id TEXT NOT NULL DEFAULT '',
+  chosen TEXT NOT NULL DEFAULT '',
+  completed INTEGER NOT NULL DEFAULT 0,
+  version INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL
+);`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_harness_runmarks_identity ON harness_runmarks(task_id, harness_hash, mode, k);`,
+	}
+	for _, q := range budgetStmts {
+		if _, err := s.db.Exec(q); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// ensureColumn adds a missing column to an existing table. SQLite has no ALTER TABLE ADD COLUMN
+// IF NOT EXISTS, so the column list is read first.
+func (s *Store) ensureColumn(table, column, definition string) error {
+	rows, err := s.db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		var (
+			no         int
+			name       string
+			typ        string
+			notNull    int
+			dflt       any
+			primaryKey int
+		)
+		if err := rows.Scan(&no, &name, &typ, &notNull, &dflt, &primaryKey); err != nil {
+			return err
+		}
+		if name == column {
+			found = true
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	_, err = s.db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + definition)
+	return err
 }
 
 // --- projects ---
