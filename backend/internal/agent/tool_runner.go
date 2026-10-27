@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/mobtgzhang/clawmind/backend/internal/codegraph"
 	"github.com/mobtgzhang/clawmind/backend/internal/harness"
 	"github.com/mobtgzhang/clawmind/backend/internal/llm"
 	"github.com/mobtgzhang/clawmind/backend/internal/security"
@@ -30,6 +31,9 @@ type ToolRunner struct {
 	Hooks HookSink
 	// Policy is the sandbox layer resolved from the plugin registry. nil means the built-in floor.
 	Policy *security.Policy
+	// Graph is the workspace symbol index for code_graph. nil means the tool reports that no index
+	// exists rather than falling back to a text search, because the two answer different questions.
+	Graph *codegraph.Index
 }
 
 func (r *ToolRunner) policy() security.Policy {
@@ -65,7 +69,9 @@ func (r *ToolRunner) runTool(ctx context.Context, name, argsJSON string, cfg Run
 	switch name {
 	case "file_read":
 		var a struct {
-			Path string `json:"path"`
+			Path   string `json:"path"`
+			Offset int    `json:"offset"`
+			Limit  int    `json:"limit"`
 		}
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 			return "", err
@@ -83,6 +89,28 @@ func (r *ToolRunner) runTool(ctx context.Context, name, argsJSON string, cfg Run
 		}
 		if len(b) > 256*1024 {
 			return string(b[:256*1024]) + "\n…(truncated)", nil
+		}
+		// A large file has to be readable in bounded spans. Returning the whole file on every call is
+		// what makes a large repository unanalysable inside a context window: the model re-reads the
+		// same 200 KB on each round until the budget is gone.
+		if a.Offset > 0 || a.Limit > 0 {
+			lines := strings.Split(string(b), "\n")
+			start := a.Offset - 1
+			if start < 0 {
+				start = 0
+			}
+			if start >= len(lines) {
+				return fmt.Sprintf("%s: offset %d 超出文件行数（共 %d 行）", filepath.ToSlash(a.Path), a.Offset, len(lines)), nil
+			}
+			limit := a.Limit
+			if limit <= 0 || limit > 400 {
+				limit = 400
+			}
+			end := start + limit
+			if end > len(lines) {
+				end = len(lines)
+			}
+			return fmt.Sprintf("%s 行 %d-%d / %d\n%s", filepath.ToSlash(a.Path), start+1, end, len(lines), strings.Join(lines[start:end], "\n")), nil
 		}
 		return string(b), nil
 	case "file_write":
@@ -203,13 +231,15 @@ func (r *ToolRunner) runTool(ctx context.Context, name, argsJSON string, cfg Run
 			"将用户给出的文本总结为 3～6 条中文要点（Markdown 列表），不要开场白。",
 			body)
 	case "code_search":
-		return r.codeSearch(ctx, argsJSON)
+		return r.codeSearch(ctx, argsJSON, cfg)
 	case "repo_tree":
 		return r.repoTree(argsJSON)
 	case "file_edit":
 		return r.fileEdit(argsJSON)
 	case "run_tests":
 		return r.runTests(ctx, argsJSON, cfg.Repo)
+	case "code_graph":
+		return r.codeGraph(argsJSON)
 	case "load_skill":
 		var a struct {
 			Name string `json:"name"`
