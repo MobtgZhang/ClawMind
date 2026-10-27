@@ -25,6 +25,23 @@ func CodeTools() []Definition {
 		{
 			Type: "function",
 			Function: FunctionSpec{
+				Name:        "code_graph",
+				Description: "Query the workspace symbol graph. This is the only tool that answers who depends on a symbol: definition, callers (impact), callees, module deps, import cycles, stats. The index is heuristic (parsed, not type-checked), so report a hit as a candidate rather than a confirmed call site.",
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"mode":  map[string]any{"type": "string", "enum": []string{"definition", "callers", "impact", "callees", "module", "cycles", "stats"}, "description": "Query mode"},
+						"query": map[string]any{"type": "string", "description": "Symbol, file, or package name. Required except for stats"},
+						"depth": map[string]any{"type": "integer", "description": "Traversal depth for callers/impact/callees, default 2, max 4"},
+						"limit": map[string]any{"type": "integer", "description": "Max rows, default 40"},
+					},
+					"required": []string{"mode"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: FunctionSpec{
 				Name:        "repo_tree",
 				Description: "List the workspace structure (bounded depth and entry count), skipping dependency and build directories.",
 				Parameters: map[string]any{
