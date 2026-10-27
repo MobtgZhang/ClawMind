@@ -18,6 +18,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/mobtgzhang/clawmind/backend/internal/agent"
 	"github.com/mobtgzhang/clawmind/backend/internal/clawmindcfg"
+	"github.com/mobtgzhang/clawmind/backend/internal/codectx"
+	"github.com/mobtgzhang/clawmind/backend/internal/codegraph"
 	"github.com/mobtgzhang/clawmind/backend/internal/domain"
 	"github.com/mobtgzhang/clawmind/backend/internal/evolution"
 	"github.com/mobtgzhang/clawmind/backend/internal/harness"
@@ -61,6 +63,13 @@ type Server struct {
 	// Cap is the per-layer memory limit the runtime actually enforces, after the memory layer has
 	// lowered it.
 	Cap memory.LayerCap
+	// CodeCache holds workspace profiles so a large repository is not walked for every turn. The
+	// profile is the input to the project classifier, and a classifier that re-reads the tree per
+	// message costs more than the decision it makes.
+	CodeCache *codectx.Cache
+	// CodeGraph holds one symbol index per workspace. nil means dependency questions fall back to a
+	// text search, which answers a different question and says so.
+	CodeGraph *codegraph.Manager
 
 	mu               sync.Mutex
 	streams          map[string]streamEntry
@@ -81,7 +90,7 @@ func NewServer(st *store.Store, cfg *clawmindcfg.Manager, client *llm.Client, me
 	if cfg == nil {
 		cfg = clawmindcfg.NewManager(".clawmind")
 	}
-	return &Server{
+	srv := &Server{
 		Store:            st,
 		Cfg:              cfg,
 		LLM:              client,
@@ -92,6 +101,18 @@ func NewServer(st *store.Store, cfg *clawmindcfg.Manager, client *llm.Client, me
 		streams:          make(map[string]streamEntry),
 		pendingApprovals: make(map[string]chan bool),
 	}
+	// Both views are opt-out rather than opt-in because a code product that cannot answer "who
+	// depends on this" is not doing code work. The flags exist so a workspace can be left out when
+	// the cost of the first walk is not worth the answer.
+	if envFlag("CLAWMIND_CODE_PROFILE", true) {
+		srv.CodeCache = codectx.NewCache(envDuration("CLAWMIND_CODE_CACHE_SECONDS", 600))
+	}
+	if envFlag("CLAWMIND_CODE_GRAPH", true) {
+		limits := codegraph.DefaultLimits()
+		limits.MaxFiles = envInt("CLAWMIND_MAX_INDEX_FILES", limits.MaxFiles)
+		srv.CodeGraph = codegraph.NewManager(limits, envDuration("CLAWMIND_GRAPH_REFRESH_SECONDS", 30))
+	}
+	return srv
 }
 
 // layerCap returns the per-layer limits the runtime actually enforces. The census compares counts
@@ -158,6 +179,7 @@ func (s *Server) Register(r *gin.Engine) {
 		s.pluginRoutes(api)
 		s.memoryRoutes(api)
 		s.harnessRoutes(api)
+		s.codeRoutes(api)
 	}
 }
 
@@ -629,17 +651,10 @@ func (s *Server) stream(c *gin.Context) {
 	if sess != nil && sess.Model != "" {
 		model = sess.Model
 	}
-	workspace := strings.TrimSpace(os.Getenv("AGENT_WORKSPACE"))
-	if workspace == "" {
-		if wd, err := os.Getwd(); err == nil {
-			workspace = wd
-		}
-	}
 	// The sandbox layer may narrow the root, never widen it, so a plugin cannot reach outside the
 	// workspace the process was given.
-	if narrowed, applied := narrowWorkspace(workspace, s.Runtime.Sandbox.Workspace); applied {
-		workspace = narrowed
-	}
+	workspace := s.defaultWorkspace()
+	graph := s.CodeGraph.Get(workspace)
 	toolsJSON, _ := json.Marshal(s.toolDefinitions())
 	promptsDir := strings.TrimSpace(os.Getenv("AGENT_PROMPTS_DIR"))
 	if s.Runtime.Prompt.PromptsDir != "" {
@@ -708,12 +723,18 @@ func (s *Server) stream(c *gin.Context) {
 		Workspace:          workspace,
 		ToolsJSON:          toolsJSON,
 		Repo:               s.repoProfile(workspace),
-		Harness:            harnessTree,
-		HarnessLessons:     harnessLessons,
-		AutoVerify:         envFlag("CLAWMIND_AUTO_VERIFY", true),
-		ProjectID:          pid,
-		ShellPolicy:        shellPolicy,
-		Loadout:            loadout,
+		// The shape is resolved inside the turn, where the request is readable: the workspace size
+		// alone cannot tell a typo fix in a monorepo from a boundary change in a forty-file project.
+		Graph:             graph,
+		GraphLoop:         envFlag("CLAWMIND_GRAPH_LOOP", true),
+		ClassifierEnabled: s.CodeCache != nil,
+		ProjectClass:      strings.ToLower(strings.TrimSpace(os.Getenv("CLAWMIND_PROJECT_CLASS"))),
+		Harness:           harnessTree,
+		HarnessLessons:    harnessLessons,
+		AutoVerify:        envFlag("CLAWMIND_AUTO_VERIFY", true),
+		ProjectID:         pid,
+		ShellPolicy:       shellPolicy,
+		Loadout:           loadout,
 	}
 	if s.MCP != nil {
 		cfg.MCPCall = s.MCP.CallTool
