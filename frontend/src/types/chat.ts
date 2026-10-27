@@ -7,6 +7,7 @@ export type PartType =
   | "tool_result"
   | "reasoning"
   | "task_flow"
+  | "graph"
   | "thinking";
 
 export interface Part {
