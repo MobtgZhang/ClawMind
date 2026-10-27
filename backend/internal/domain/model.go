@@ -35,6 +35,9 @@ const (
 	// Cursor 风格分段：任务流程 → 思考 → 最终输出（依次展示）
 	PartTaskFlow PartType = "task_flow"
 	PartThinking PartType = "thinking"
+	// PartGraph 是图执行轨迹：节点顺序与分支决策。图循环的可审计性来自这条轨迹，
+	// 没有它读者无法区分哪条分支产生了结论。
+	PartGraph PartType = "graph"
 )
 
 // Part is one segment inside a message.
