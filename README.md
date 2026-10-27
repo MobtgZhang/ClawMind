@@ -18,6 +18,7 @@ Everything runs locally: a single Go binary, a pure-Go SQLite database (no CGO),
 ## Highlights
 
 - **Code-first loop** — locate → edit → verify → wrap up. A claimed fix is checked against the project, not asserted.
+- **Shape follows size** — a small project keeps the single pass; a complex one runs a graph loop that measures the blast radius before editing and re-enters the edit node on a bounded back edge when verification fails.
 - **Bounded repository awareness** — language mix, manifests, inferred `test`/`build`/`lint`/`format` commands and a capped file tree, without shelling out.
 - **Editable harness surface** — `AGENTS.md`, `tool_guidance.md`, `lessons.md`, `skills/`, `scripts/`. Always-on text is the most expensive component, so knowledge is pushed into on-demand skills and scripts.
 - **Evidence-constrained evolution** — Propose → Probe → Compose → blind Select → Reflect, with per-edit verdicts (`helped` / `hurt` / `no observed effect` / `confounded`). Keeping the baseline is a legitimate outcome.
@@ -70,10 +71,15 @@ Code tools (`backend/internal/tools/code.go`, executed by `backend/internal/agen
 | `run_tests` | Run the inferred verification command | Restricted to `AGENT_WORKSPACE`; high-risk shell needs approval |
 | `load_skill` | Read an on-demand harness skill | Read-only, zero cost until triggered |
 | `delegate` | Run one harness subagent in its own context | Answer capped at 4000 characters |
+| `code_graph` | Query the symbol graph: definition, callers, impact, callees, module deps, package cycles, stats | Heuristic parse (not type-checked); a hit is a candidate, not a confirmed call site |
 
 Custom skills can be imported as OpenAI-tools JSON or created in the sidebar; they merge with `TOOLS_PATH`, plugin contributions and the built-ins. Community `SKILL.md` layouts import through `POST /api/skills/import-md`: `name`, `description` and `mode` are parsed from the frontmatter, the whole tree is validated before the write, and a skill missing a trigger line is fixed by `AutoTrigger()` — a skill never named in always-on text is never opened.
 
 The five priority skills and `scripts/preflight.py` come from the seeded surface (`CLAWMIND_SEED_SKILLS=1` or `POST /api/harness/seed`). Details: [docs/skills-roadmap.md](docs/skills-roadmap.md).
+
+## Simple and complex projects
+
+One fixed budget cannot serve a three-file script and a three-thousand-file repository: the same round cap that is generous for the first is a dead end for the second, and a search cap that is safe for the second starves the first into guessing. `codectx.Classify` scores the workspace and the request together — files, symbols, modules, fan-in, package cycles, CI contract, plus whether the request crosses a boundary — and produces the loop shape for the turn. `simple` keeps the single pass; `complex` runs the graph loop (plan → locate → analyze → act → verify → review → answer, with bounded back edges). The classification and the execution trace are written into the transcript, and `GET /api/code` reports both. Details: [docs/code-agent.md](docs/code-agent.md).
 
 ## Plugin layers
 
@@ -104,6 +110,12 @@ Before anything is written, the whole tree is validated; a proposal that fails v
 | `AGENT_WORKSPACE` | — | Root for file and shell tools |
 | `CLAWMIND_CODE_PROFILE` | `true` | Inject the repository profile |
 | `CLAWMIND_AUTO_VERIFY` | `true` | Run the inferred test command after edits |
+| `CLAWMIND_CODE_GRAPH` | `true` | Symbol index, one per workspace, refreshed incrementally by `size@mtime` |
+| `CLAWMIND_MAX_INDEX_FILES` | `6000` | Index file ceiling |
+| `CLAWMIND_GRAPH_REFRESH_SECONDS` | `30` | Index refresh window |
+| `CLAWMIND_CODE_CACHE_SECONDS` | `600` | Profile cache window |
+| `CLAWMIND_PROJECT_CLASS` | `auto` | `auto` scores; `simple` / `complex` force the class |
+| `CLAWMIND_GRAPH_LOOP` | `true` | Complex projects run the graph loop |
 | `CLAWMIND_EVOLUTION` | `false` | Enable the evolution engine |
 | `CLAWMIND_EVOLUTION_K` | `3` | Candidates / sequential rounds (1–8) |
 | `CLAWMIND_EVOLUTION_MODE` | `parallel` | `parallel` · `sequential` · `dry` |
