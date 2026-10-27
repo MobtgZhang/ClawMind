@@ -41,6 +41,11 @@ type Profile struct {
 	Tree      []string       `json:"tree"`
 	Scanned   int            `json:"scanned"`
 	Truncated bool           `json:"truncated"`
+	// TestFiles counts files whose name looks like a test: the verification gate is only worth
+	// running when something can actually be executed.
+	TestFiles int `json:"testFiles"`
+	// HasCI marks a CI config, which is a contract the change has to keep.
+	HasCI bool `json:"hasCI"`
 }
 
 // MaxTreeEntries bounds the file listing injected into a prompt.
@@ -95,6 +100,12 @@ func Detect(root string) *Profile {
 		name := filepath.Base(rel)
 		if isManifest(name) {
 			p.Manifests = append(p.Manifests, rel)
+		}
+		if isTestName(name) {
+			p.TestFiles++
+		}
+		if strings.HasPrefix(rel, ".github/workflows/") || strings.HasPrefix(rel, ".gitlab-ci.yml") {
+			p.HasCI = true
 		}
 		lang := languageOf(strings.ToLower(filepath.Ext(rel)))
 		if lang == "" {
@@ -269,4 +280,25 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(out)
+}
+
+// isTestName reports whether a filename looks like a test file. The classifier uses this to decide
+// whether a verification gate can actually be executed: a gate with nothing to run is theatre.
+func isTestName(name string) bool {
+	lower := strings.ToLower(name)
+	if strings.HasSuffix(lower, "_test.go") || strings.HasSuffix(lower, ".test.ts") ||
+		strings.HasSuffix(lower, ".test.js") || strings.HasSuffix(lower, ".spec.ts") ||
+		strings.HasSuffix(lower, ".spec.js") || strings.HasSuffix(lower, ".test.tsx") {
+		return true
+	}
+	if strings.HasPrefix(lower, "test_") || strings.HasPrefix(lower, "test.") {
+		return true
+	}
+	return strings.Contains(lower, "/test/") || strings.Contains(lower, "tests/")
+}
+
+// LanguageOf maps a lowercase extension to a language name. The graph index needs the same mapping
+// as the profile, so it exists once rather than as a second table that can drift.
+func LanguageOf(ext string) string {
+	return languageOf(ext)
 }
