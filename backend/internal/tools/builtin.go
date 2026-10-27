@@ -11,7 +11,9 @@ func AtomicTools() []Definition {
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"path": map[string]any{"type": "string", "description": "Relative path under workspace"},
+						"path":   map[string]any{"type": "string", "description": "Relative path under workspace"},
+						"offset": map[string]any{"type": "integer", "description": "1-based first line: use it on large files instead of reading the whole file"},
+						"limit":  map[string]any{"type": "integer", "description": "Max lines from offset (ceiling 400)"},
 					},
 					"required": []string{"path"},
 				},
