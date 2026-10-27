@@ -52,6 +52,9 @@ flowchart LR
 | `internal/harness` | 可编辑面：树、校验、触发行、种子面、hook 事件集合 |
 | `internal/evolution` | 自进化：Propose–Probe–Compose–Select–Reflect、证据与真实执行探针、账本（R=4k / P=3k）、runmark 与 resume、盲选与丢弃记录 |
 | `internal/security` | 安全地板：命令 deny / high-risk、路径与 SSRF 校验、`Policy`（插件层只能添加模式、只能降低上限） |
+| `internal/codectx` | 工作区画像（语言、manifest、推断命令、测试文件、CI）+ 项目分级（`Classify` 把工作区与请求一起打分，产出 `Budget`）+ 画像缓存 |
+| `internal/codegraph` | 有边界的启发式符号图：定义、调用者/被调用者、模块依赖、包级循环；按 `size@mtime` 增量刷新，`Manager` 每工作区一个索引 |
+| `internal/graphloop` | 图循环：节点 + 条件边（回边带上限）+ `State` 与执行轨迹。工具执行、审批、hook 仍由 `internal/agent` 提供，图不建立第二个运行时 |
 
 ## 目录与模块（前端）
 
@@ -68,6 +71,7 @@ flowchart LR
 1. `POST /api/sessions/:id/messages` 写入用户消息并创建 **占位助手消息**。
 2. 前端 `GET /api/sessions/:id/stream?messageId=...` 建立 SSE。
 3. `agent.RunStream`：
+   - 先按项目分级分发形状：`complex` 走 `graphloop`（plan → locate → analyze → act → verify → review → answer，带条件回边），`simple` 走原来的单遍路径。两者共用同一套工具执行、审批与 hook 策略；
    - 流式输出 **任务流程**、**思考**（各为独立 `partIndex`）；
    - `Complete` + 工具执行循环（若有）；
    - 最后对 **正文** 再 `StreamChat`，增量写回 SQLite 并推送 `delta`。
@@ -83,6 +87,7 @@ flowchart LR
 - **`CLAWMIND_PLUGIN_DIR`**：插件目录，默认 `.clawmind/plugins`；按目录名顺序挂载。
 - **检索预算**：`CLAWMIND_MEMORY_MAX_ITEMS`（24）、`CLAWMIND_MEMORY_CHAR_BUDGET`（2000）、`CLAWMIND_MEMORY_TIMEOUT_MS`（3000）；分层上限 `CLAWMIND_MEMORY_L0_CAP`..`L3_CAP`。插件层只能降低这些值。
 - **`CLAWMIND_TOKEN_BUDGET`**：单次流式生成 completion token 软上限，`0` 不限制。
+- **代码图与项目分级**：`CLAWMIND_CODE_GRAPH`（`true`）启用符号索引，`CLAWMIND_MAX_INDEX_FILES`（6000）是索引文件上限，`CLAWMIND_GRAPH_REFRESH_SECONDS`（30）是刷新窗口；`CLAWMIND_GRAPH_LOOP`（`true`）允许复杂项目走图；`CLAWMIND_PROJECT_CLASS`（`auto` · `simple` · `complex`）强制分级；`CLAWMIND_CODE_CACHE_SECONDS`（600）是画像缓存窗口。
 - 更多变量见 [architecture-evolution.md](architecture-evolution.md) 环境变量表。
 
 ## 延伸阅读
