@@ -31,6 +31,10 @@ function partLabel(t: PartType): string {
       return "任务流程";
     case "thinking":
       return "思考过程";
+    case "graph":
+      return "执行图";
+    case "reasoning":
+      return "评审";
     case "text":
       return "回答";
     default:
@@ -84,6 +88,12 @@ function sectionThinkingOpen(sec: { type: PartType }): boolean | undefined {
   if (sec.type !== "thinking") return undefined;
   if (isStreamingThis.value) return thinkingStreamOpen();
   return undefined;
+}
+
+/** 执行图：图循环的轨迹是本轮的主要产出，流式期间保持展开 */
+function sectionGraphOpen(sec: { type: PartType }): boolean | undefined {
+  if (sec.type !== "graph") return undefined;
+  return isStreamingThis.value;
 }
 
 const persistedBlocks = computed(() => {
@@ -182,7 +192,7 @@ function nextUserVersion() {
 function assistantExportMarkdown(m: Message): string {
   const chunks: string[] = [];
   for (const p of m.parts) {
-    if (p.type === "text" || p.type === "thinking" || p.type === "task_flow") {
+    if (p.type === "text" || p.type === "thinking" || p.type === "task_flow" || p.type === "graph") {
       if (p.text) chunks.push(p.text);
     } else if (p.type === "code") {
       chunks.push("```" + (p.language || "") + "\n" + (p.text || "") + "\n```");
@@ -336,9 +346,9 @@ const summaryCls =
         <template v-if="isStreamingThis && liveSections && liveSections.length > 0">
           <template v-for="sec in liveSections" :key="'s' + sec.index">
             <details
-              v-if="sec.type === 'task_flow'"
+              v-if="sec.type === 'task_flow' || sec.type === 'graph'"
               class="group/tf rounded-lg border border-ink/10 bg-surface-muted/50 dark:bg-surface-muted/25"
-              :open="sectionTaskFlowOpen(sec)"
+              :open="sectionTaskFlowOpen(sec) ?? sectionGraphOpen(sec)"
             >
               <summary :class="summaryCls">
                 <svg
@@ -438,7 +448,7 @@ const summaryCls =
               />
             </div>
             <details
-              v-else-if="block.kind === 'part' && block.part.type === 'task_flow'"
+              v-else-if="block.kind === 'part' && (block.part.type === 'task_flow' || block.part.type === 'graph')"
               class="group/tf rounded-lg border border-ink/10 bg-surface-muted/50 dark:bg-surface-muted/25"
             >
               <summary :class="summaryCls">
