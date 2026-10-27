@@ -3,19 +3,18 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/mobtgzhang/clawmind/backend/internal/codectx"
+	"github.com/mobtgzhang/clawmind/backend/internal/codegraph"
 	"github.com/mobtgzhang/clawmind/backend/internal/domain"
 	"github.com/mobtgzhang/clawmind/backend/internal/harness"
 	"github.com/mobtgzhang/clawmind/backend/internal/llm"
 	"github.com/mobtgzhang/clawmind/backend/internal/memory"
 	"github.com/mobtgzhang/clawmind/backend/internal/security"
 	"github.com/mobtgzhang/clawmind/backend/internal/store"
-	"github.com/mobtgzhang/clawmind/backend/internal/thread"
 )
 
 // MessageUpdater is the store subset the agent needs.
@@ -31,412 +30,6 @@ type MessageUpdater interface {
 // built off the turn; without it the agent writes the layers itself, which is the fallback path.
 type Observer interface {
 	Observe(ctx context.Context, sessionID, projectID, text string) error
-}
-
-// RunStream generates assistant content with task → thinking → tools → streamed answer.
-func RunStream(
-	ctx context.Context,
-	st MessageUpdater,
-	mem memory.Store,
-	client llm.Provider,
-	cfg RunConfig,
-	onEvent func(domain.StreamEvent) error,
-) error {
-	msg, err := st.GetMessage(ctx, cfg.AssistantMessageID)
-	if err != nil || msg == nil {
-		return err
-	}
-	history, err := st.ListMessages(ctx, msg.SessionID)
-	if err != nil {
-		return err
-	}
-	sess, _ := st.GetSession(ctx, msg.SessionID)
-	choice := thread.ParseSiblingChoice(nil)
-	if sess != nil {
-		choice = thread.ParseSiblingChoice(sess.Metadata)
-	}
-	path := thread.BuildPathForSession(history, choice)
-	var upto []domain.Message
-	if msg.ParentMessageID != nil && *msg.ParentMessageID != "" {
-		upto = thread.PrefixThroughUser(path, *msg.ParentMessageID)
-	}
-	if len(upto) == 0 {
-		for _, m := range history {
-			if m.ID == cfg.AssistantMessageID {
-				break
-			}
-			upto = append(upto, m)
-		}
-	}
-	runner := &ToolRunner{Workspace: cfg.Workspace, Client: client, Harness: cfg.Harness, MCPCall: cfg.MCPCall, Policy: cfg.ShellPolicy}
-	runner.Hooks = cfg.Hooks
-	var parts []domain.Part
-
-	kept := TrimHistoryByAssistantRounds(upto, cfg.MaxAgentRounds)
-	kept = TrimHistoryByEstimatedTokens(kept, cfg.MaxContextTokens)
-	// PostCompact only fires when context was actually dropped. A hook that watches compaction has
-	// to be told when it happened; otherwise the event is a promise the runtime never keeps.
-	if cfg.Hooks != nil && len(kept) < len(upto) {
-		if _, err := runner.fireHooks(ctx, "PostCompact", cfg, "", map[string]any{"droppedMessages": len(upto) - len(kept)}, ""); err != nil {
-			return stopTurn(ctx, st, msg, &parts, onEvent, "PostCompact", err)
-		}
-		upto = kept
-	}
-
-	lastUser := lastUserText(upto)
-	pid := ""
-	if sess != nil && sess.ProjectID != nil {
-		pid = *sess.ProjectID
-	}
-
-	system := cfg.SystemPrompt
-	system += "\n\n" + systemRuntimeContextBlock(time.Now())
-	if mem != nil {
-		memQuery := truncateRunes(strings.TrimSpace(lastUser), 512)
-		lines, _ := mem.RetrieveLevels(ctx, msg.SessionID, pid, memQuery)
-		if len(lines) > 0 {
-			system += "\n\n多级记忆（L3 全局 → L2 项目 → L1 会话）：\n- " + strings.Join(lines, "\n- ")
-		}
-	}
-	prompts := loadPromptBundle(cfg.PromptsDir)
-	system += "\n\n" + prompts.SystemSuffix
-
-	if cfg.Repo != nil {
-		if block := cfg.Repo.PromptBlock(4000); block != "" {
-			system += "\n\n" + block
-		}
-	}
-	if len(cfg.Harness) > 0 {
-		if block := cfg.Harness.PromptBlock(6000); block != "" {
-			system += "\n\n" + block
-		}
-	}
-	if block := harnessLessonsBlock(cfg.HarnessLessons); block != "" {
-		system += "\n\n" + block
-	}
-	if block := loadoutBlock(cfg.Loadout); block != "" {
-		system += "\n\n" + block
-	}
-
-	// Stop fires on every exit path, including a cancelled or failed turn: a hook that watches the
-	// end of a run has to see the run end, not only the successful branch.
-	defer func() {
-		if cfg.Hooks == nil {
-			return
-		}
-		_, _ = runner.fireHooks(ctx, "Stop", cfg, "", map[string]any{"answer": lastAnswerText(parts)}, "")
-	}()
-
-	// Context-level hooks inject guidance into the system prompt. A veto here stops the turn before
-	// any model call is paid for, which is the point of a pre-turn hook.
-	if cfg.Hooks != nil {
-		guidance, herr := runner.fireHooks(ctx, "SessionStart", cfg, "", nil, "")
-		if herr != nil {
-			return stopTurn(ctx, st, msg, &parts, onEvent, "SessionStart", herr)
-		}
-		if guidance != "" {
-			system += "\n\nhook 注入（SessionStart）：\n" + guidance
-		}
-		guidance, herr = runner.fireHooks(ctx, "UserPromptSubmit", cfg, "", map[string]any{"prompt": lastUser}, lastUser)
-		if herr != nil {
-			return stopTurn(ctx, st, msg, &parts, onEvent, "UserPromptSubmit", herr)
-		}
-		if guidance != "" {
-			system += "\n\nhook 注入（UserPromptSubmit）：\n" + guidance
-		}
-	}
-
-	emitStartIdx := func(pt domain.PartType, idx int) error {
-		return onEvent(domain.StreamEvent{Type: domain.EventPartStart, MessageID: msg.ID, PartIndex: idx, PartType: pt})
-	}
-	emitDeltaIdx := func(idx int, t string) error {
-		if t == "" {
-			return nil
-		}
-		return onEvent(domain.StreamEvent{Type: domain.EventDelta, MessageID: msg.ID, PartIndex: idx, Text: t})
-	}
-	emitEndIdx := func(idx int) error {
-		return onEvent(domain.StreamEvent{Type: domain.EventPartEnd, MessageID: msg.ID, PartIndex: idx})
-	}
-
-	phaseSystem := truncateRunes(system, 6000)
-
-	// --- 任务流程（流式） ---
-	planUser := expandLastUser(prompts.TaskFlowUser, lastUser)
-	if err := streamPhaseMarkdown(ctx, client, cfg, phaseSystem, planUser, domain.PartTaskFlow, &parts, msg.ID, st, emitStartIdx, emitDeltaIdx, emitEndIdx); err != nil {
-		return err
-	}
-
-	// --- 思考流程（流式） ---
-	thinkUser := expandLastUser(prompts.ThinkingUser, lastUser)
-	if err := streamPhaseMarkdown(ctx, client, cfg, phaseSystem, thinkUser, domain.PartThinking, &parts, msg.ID, st, emitStartIdx, emitDeltaIdx, emitEndIdx); err != nil {
-		return err
-	}
-
-	work := llm.ToChatMessages(system, upto)
-	var toolsRaw json.RawMessage
-	if len(cfg.ToolsJSON) > 0 {
-		toolsRaw = cfg.ToolsJSON
-	}
-
-	maxTools := cfg.MaxAgentRounds
-	if maxTools < 1 {
-		maxTools = 8
-	}
-	if maxTools > 32 {
-		maxTools = 32
-	}
-
-	var hitToolRoundCap bool
-	var prevToolRoundSig string
-
-	var tokenAccum int
-	recordUsage := func(res *llm.CompleteResult) {
-		if res == nil {
-			return
-		}
-		t := res.TotalTokens
-		if t <= 0 {
-			t = res.PromptTokens + res.CompletionTokens
-		}
-		tokenAccum += t
-		slog.Info("llm.completion_usage",
-			"prompt_tokens", res.PromptTokens,
-			"completion_tokens", res.CompletionTokens,
-			"total_tokens", t,
-			"accum", tokenAccum,
-			"assistant_message_id", cfg.AssistantMessageID,
-		)
-	}
-
-	for round := 0; round < maxTools; round++ {
-		if cfg.TokenBudget > 0 && tokenAccum > cfg.TokenBudget {
-			_ = onEvent(domain.StreamEvent{Type: domain.EventError, MessageID: msg.ID, Error: "已达到本次对话的 token 预算上限（CLAWMIND_TOKEN_BUDGET）"})
-			parts = append(parts, domain.Part{Type: domain.PartText, Text: "已停止：超出配置的 token 预算。"})
-			_ = st.UpdateMessageParts(ctx, msg.ID, cloneParts(parts))
-			_ = onEvent(domain.StreamEvent{Type: domain.EventDone, MessageID: msg.ID})
-			_ = st.TouchSession(ctx, msg.SessionID)
-			return nil
-		}
-		res, err := client.Complete(ctx, llm.CompleteParams{
-			BaseURL:     cfg.BaseURL,
-			APIKey:      cfg.APIKey,
-			Model:       cfg.Model,
-			Messages:    work,
-			Tools:       toolsRaw,
-			ToolChoice:  "auto",
-			Temperature: cfg.Temperature,
-			TopP:        cfg.TopP,
-			TopK:        cfg.TopK,
-		})
-		if err != nil {
-			_ = onEvent(domain.StreamEvent{Type: domain.EventError, MessageID: msg.ID, Error: err.Error()})
-			parts = append(parts, domain.Part{Type: domain.PartText, Text: composeFailureReply(err)})
-			_ = st.UpdateMessageParts(ctx, msg.ID, cloneParts(parts))
-			_ = onEvent(domain.StreamEvent{Type: domain.EventDone, MessageID: msg.ID})
-			_ = st.TouchSession(ctx, msg.SessionID)
-			return nil
-		}
-		recordUsage(res)
-		if len(res.ToolCalls) == 0 {
-			// 模型直接文本结束：不再发起第二次补全，避免重复与额外费用。
-			if strings.TrimSpace(res.Content) != "" {
-				parts = append(parts, domain.Part{Type: domain.PartText, Text: res.Content})
-				ti := len(parts) - 1
-				if err := emitStartIdx(domain.PartText, ti); err != nil {
-					return err
-				}
-				if err := emitDeltaIdx(ti, res.Content); err != nil {
-					return err
-				}
-				if err := emitEndIdx(ti); err != nil {
-					return err
-				}
-				_ = st.UpdateMessageParts(ctx, msg.ID, cloneParts(parts))
-				_ = onEvent(domain.StreamEvent{Type: domain.EventDone, MessageID: msg.ID})
-				_ = st.TouchSession(ctx, msg.SessionID)
-				appendMemoryAfterTurn(mem, ctx, msg.SessionID, pid, lastUser, res.Content, cfg.Observer)
-				return nil
-			}
-			break
-		}
-
-		if round == maxTools-1 {
-			hitToolRoundCap = true
-		}
-
-		var sigBuilder strings.Builder
-		for _, tc := range res.ToolCalls {
-			sigBuilder.WriteString(tc.Name)
-			sigBuilder.WriteByte(0)
-			sigBuilder.WriteString(tc.Arguments)
-			sigBuilder.WriteByte(30)
-		}
-		toolSig := sigBuilder.String()
-		if toolSig != "" && toolSig == prevToolRoundSig {
-			warn := "检测到连续两轮相同的工具调用，已停止以免无效循环。"
-			_ = onEvent(domain.StreamEvent{Type: domain.EventError, MessageID: msg.ID, Error: warn})
-			parts = append(parts, domain.Part{Type: domain.PartText, Text: warn})
-			_ = st.UpdateMessageParts(ctx, msg.ID, cloneParts(parts))
-			_ = onEvent(domain.StreamEvent{Type: domain.EventDone, MessageID: msg.ID})
-			_ = st.TouchSession(ctx, msg.SessionID)
-			return nil
-		}
-		prevToolRoundSig = toolSig
-
-		var tco []llm.ToolCallOut
-		var editedThisRound []string
-		for _, tc := range res.ToolCalls {
-			tco = append(tco, llm.ToolCallOut{
-				ID:   tc.ID,
-				Type: "function",
-				Function: struct {
-					Name      string `json:"name"`
-					Arguments string `json:"arguments"`
-				}{Name: tc.Name, Arguments: tc.Arguments},
-			})
-		}
-		work = append(work, llm.ChatMessage{Role: "assistant", ToolCalls: tco})
-
-		for _, tc := range res.ToolCalls {
-			_ = onEvent(domain.StreamEvent{
-				Type:       domain.EventToolCall,
-				MessageID:  msg.ID,
-				ToolCallID: tc.ID,
-				ToolName:   tc.Name,
-				Arguments:  tc.Arguments,
-			})
-			var out string
-			var rerr error
-			if tc.Name == "shell_exec" {
-				cmd := ShellCommandFromArgs(tc.Arguments)
-				policy := runner.policy()
-				if policy.CommandDenied(cmd) {
-					out = "错误: 该命令被安全策略禁止执行（命中 shell denylist）。"
-				}
-				// A plugin layer that turns approval off means high-risk commands are refused rather
-				// than prompted: the layer is a policy, not a suggestion the agent can decline.
-				if out == "" && policy.CommandHighRisk(cmd) && !policy.AllowApproval {
-					out = "错误: 该命令属于高风险且沙箱策略关闭了人工确认。"
-				}
-				if out == "" && policy.CommandHighRisk(cmd) && cfg.WaitShellApproval != nil {
-					ok, aerr := cfg.WaitShellApproval(ctx, ShellApprovalRequest{
-						SessionID:      cfg.SessionID,
-						MessageID:      msg.ID,
-						ToolCallID:     tc.ID,
-						ToolName:       tc.Name,
-						Arguments:      tc.Arguments,
-						CommandSummary: truncateRunes(cmd, 240),
-					})
-					if aerr != nil {
-						out = "错误: " + aerr.Error()
-					} else if !ok {
-						out = "用户拒绝执行该 shell 命令。"
-					}
-				}
-				if out == "" {
-					t0 := time.Now()
-					out, rerr = runner.Run(ctx, tc.Name, tc.Arguments, cfg)
-					slog.Info("agent.tool", "name", tc.Name, "ms", time.Since(t0).Milliseconds(), "message_id", msg.ID)
-				}
-			} else {
-				t0 := time.Now()
-				out, rerr = runner.Run(ctx, tc.Name, tc.Arguments, cfg)
-				slog.Info("agent.tool", "name", tc.Name, "ms", time.Since(t0).Milliseconds(), "message_id", msg.ID)
-			}
-			if rerr != nil {
-				out = "错误: " + rerr.Error()
-			}
-			if rerr != nil || strings.HasPrefix(strings.TrimSpace(out), "错误:") {
-				reflexionAppend(ctx, client, cfg, &work, mem, msg.SessionID, pid, tc, out, recordUsage)
-			}
-			_ = onEvent(domain.StreamEvent{
-				Type:       domain.EventToolRes,
-				MessageID:  msg.ID,
-				ToolCallID: tc.ID,
-				ToolName:   tc.Name,
-				Result:     out,
-			})
-			parts = append(parts, domain.Part{
-				Type:       domain.PartToolCall,
-				ToolCallID: tc.ID,
-				Name:       tc.Name,
-				Arguments:  tc.Arguments,
-			})
-			parts = append(parts, domain.Part{
-				Type:       domain.PartToolResult,
-				ToolCallID: tc.ID,
-				Result:     out,
-			})
-			work = append(work, llm.ChatMessage{
-				Role:       "tool",
-				ToolCallID: tc.ID,
-				Content:    out,
-			})
-			if (tc.Name == "file_edit" || tc.Name == "file_write") && rerr == nil {
-				if p := toolArgPath(tc.Arguments); p != "" {
-					editedThisRound = append(editedThisRound, p)
-				}
-			}
-			_ = st.UpdateMessageParts(ctx, msg.ID, cloneParts(parts))
-		}
-
-		if gate := verifyGate(ctx, cfg, runner, editedThisRound, msg.ID, onEvent); gate != "" {
-			work = append(work, llm.ChatMessage{Role: "user", Content: gate})
-			if mem != nil {
-				_ = mem.AppendLevel(ctx, msg.SessionID, pid, 1, "verification", truncateRunes(gate, 800))
-			}
-		}
-	}
-
-	if hitToolRoundCap {
-		warn := "已达到工具调用轮次上限（maxAgentRounds）：本轮工具已执行，但不再继续请求模型。可在设置中提高 maxAgentRounds 或拆分任务。"
-		_ = onEvent(domain.StreamEvent{Type: domain.EventError, MessageID: msg.ID, Error: warn})
-		parts = append(parts, domain.Part{Type: domain.PartText, Text: warn})
-		_ = st.UpdateMessageParts(ctx, msg.ID, cloneParts(parts))
-		_ = onEvent(domain.StreamEvent{Type: domain.EventDone, MessageID: msg.ID})
-		_ = st.TouchSession(ctx, msg.SessionID)
-		return nil
-	}
-
-	parts = append(parts, domain.Part{Type: domain.PartText, Text: ""})
-	textIdx := len(parts) - 1
-	if err := emitStartIdx(domain.PartText, textIdx); err != nil {
-		return err
-	}
-	var acc strings.Builder
-	streamParams := llm.StreamParams{
-		BaseURL:     cfg.BaseURL,
-		APIKey:      cfg.APIKey,
-		Model:       cfg.Model,
-		Messages:    work,
-		Temperature: cfg.Temperature,
-		TopP:        cfg.TopP,
-		TopK:        cfg.TopK,
-	}
-	streamErr := client.StreamChat(ctx, streamParams, func(delta string) error {
-		acc.WriteString(delta)
-		parts[textIdx].Text = acc.String()
-		_ = st.UpdateMessageParts(ctx, msg.ID, cloneParts(parts))
-		return emitDeltaIdx(textIdx, delta)
-	})
-	if streamErr != nil {
-		_ = onEvent(domain.StreamEvent{Type: domain.EventError, MessageID: msg.ID, Error: streamErr.Error()})
-		if acc.Len() == 0 {
-			parts[textIdx].Text = composeFailureReply(streamErr)
-		}
-	}
-	if err := emitEndIdx(textIdx); err != nil {
-		return err
-	}
-	_ = st.UpdateMessageParts(ctx, msg.ID, cloneParts(parts))
-	_ = onEvent(domain.StreamEvent{Type: domain.EventDone, MessageID: msg.ID})
-	_ = st.TouchSession(ctx, msg.SessionID)
-
-	if mem != nil && acc.Len() > 0 {
-		appendMemoryAfterTurn(mem, ctx, msg.SessionID, pid, lastUser, acc.String(), cfg.Observer)
-	}
-	return nil
 }
 
 // appendMemoryAfterTurn records one turn. With a distiller the raw text goes to L0 and the higher
@@ -602,6 +195,21 @@ type RunConfig struct {
 	ToolsJSON        json.RawMessage // JSON array of OpenAI tool defs
 	// Repo is the code workspace profile: languages, manifests and inferred commands.
 	Repo *codectx.Profile
+	// Budget is the loop shape the project class produced: node count, re-entry, fan-out and search
+	// caps. It is reported to the transcript because the shape is a decision, not a default.
+	Budget codectx.Budget
+	// Graph is the workspace symbol index. nil means the graph shape cannot answer dependency
+	// questions and the turn runs as a single pass.
+	Graph *codegraph.Index
+	// GraphLoop enables the graph shape for complex projects.
+	GraphLoop bool
+	// ClassReasons is the classifier's justification, surfaced so a reader can see why the shape
+	// changed for this turn.
+	ClassifierEnabled bool
+	// ProjectClass forces a class ("simple" or "complex") and skips the score. It is the operator's
+	// override for a repository the score cannot see, such as one whose complexity lives in runtime
+	// behaviour rather than in file count.
+	ProjectClass string
 	// Harness is the editable component surface injected into the system prompt.
 	Harness harness.Tree
 	// HarnessLessons are transferable lessons read from the experience library.
