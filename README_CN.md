@@ -18,6 +18,7 @@ ClawMind 不做通用「什么任务都能做」的助手，而是收窄到**代
 ## 特点
 
 - **代码向工作流**：定位 → 改动 → 验证 → 收尾。「我修好了」必须被仓库证明，而不是被声明。
+- **按项目规模分流**：简单项目走原来的单遍；复杂项目走图循环——先算影响面，再改动，验证失败沿带上限的回边回到改动节点。
 - **有边界的仓库感知**：语言分布、manifest、推断的 `test`/`build`/`lint`/`format` 命令、有上限的目录树，且不 shell out。
 - **可编辑面**：`AGENTS.md`、`tool_guidance.md`、`lessons.md`、`skills/`、`scripts/`。常驻文本最贵，所以知识优先放进按需技能与脚本。
 - **受证据约束的进化**：Propose → Probe → Compose → 盲选 → Reflect，逐条改动给出结论（`helped` / `hurt` / `no observed effect` / `confounded`）。保留基线是合法结论。
@@ -70,10 +71,15 @@ CLAWMIND_EVOLUTION=1 make run
 | `run_tests` | 执行推断的验证命令 | 受 `AGENT_WORKSPACE` 限制，高危命令需确认 |
 | `load_skill` | 按需读取 harness 技能 | 只读，触发前零成本 |
 | `delegate` | 在独立上下文跑一个 harness subagent | 回答上限 4000 字符 |
+| `code_graph` | 查询符号图：定义 / 调用者 / 影响面 / 模块依赖 / 包级循环 / 统计 | 启发式解析（不做类型检查），结果作为候选而非确认调用点 |
 
 自定义技能可在侧栏导入（OpenAI tools JSON）或新建，与 `TOOLS_PATH` 指向的 JSON、插件贡献的工具及内置工具合并。社区 `SKILL.md` 布局可通过 `POST /api/skills/import-md` 导入：frontmatter 的 `name` / `description` / `mode` 解析成组件，写入前跑整树校验，缺触发行的技能由 `AutoTrigger()` 补齐——没有被常驻文本点名的技能永远不会被打开。
 
 五个优先技能与 `scripts/preflight.py` 由种子面写入（`CLAWMIND_SEED_SKILLS=1` 或 `POST /api/harness/seed`）。详见 [docs/skills-roadmap.md](docs/skills-roadmap.md)。
+
+## 简单项目与复杂项目
+
+一个固定预算无法同时服务三行脚本和三千文件的仓库：同样的轮次上限对前者宽裕、对后者是死路，对后者安全的搜索上限会让前者饿到靠猜。`codectx.Classify` 把工作区与请求**一起**打分——文件数、符号数、模块数、最大入度、包级循环、CI 契约，加上请求本身是否跨边界——产出本轮的循环形状。`simple` 走原来的单遍路径；`complex` 走图循环（plan → locate → analyze → act → verify → review → answer，失败回边带上限）。分级与执行轨迹写进 transcript，`GET /api/code` 可查看两者。详见 [docs/code-agent.md](docs/code-agent.md)。
 
 ## 插件层
 
@@ -104,6 +110,12 @@ L0 conversation（原始轮次）→ L1 atom（事实）→ L2 scenario（项目
 | `AGENT_WORKSPACE` | — | 文件与 shell 的根路径 |
 | `CLAWMIND_CODE_PROFILE` | `true` | 注入仓库画像 |
 | `CLAWMIND_AUTO_VERIFY` | `true` | 改动后自动跑测试 |
+| `CLAWMIND_CODE_GRAPH` | `true` | 符号图索引（每工作区一个，按 `size@mtime` 增量刷新） |
+| `CLAWMIND_MAX_INDEX_FILES` | `6000` | 索引文件上限 |
+| `CLAWMIND_GRAPH_REFRESH_SECONDS` | `30` | 索引刷新窗口 |
+| `CLAWMIND_CODE_CACHE_SECONDS` | `600` | 画像缓存窗口 |
+| `CLAWMIND_PROJECT_CLASS` | `auto` | `auto` 打分；`simple` / `complex` 强制分级 |
+| `CLAWMIND_GRAPH_LOOP` | `true` | 复杂项目走图循环 |
 | `CLAWMIND_EVOLUTION` | `false` | 启用自进化引擎 |
 | `CLAWMIND_EVOLUTION_K` | `3` | 候选数 / 串行轮数（1–8） |
 | `CLAWMIND_EVOLUTION_MODE` | `parallel` | `parallel` · `sequential` · `dry` |
