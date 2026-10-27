@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -19,6 +20,11 @@ import (
 // MaxSearchResults bounds one code_search reply so it does not crowd the context.
 const MaxSearchResults = 60
 
+// MaxSearchScan is the ceiling on files one search may walk. It is a ceiling, not a target: the
+// project class picks the working value, and a large repository needs a larger one than a three-file
+// script without ever becoming unbounded.
+const MaxSearchScan = 20000
+
 // searchArgs is the code_search argument shape.
 type searchArgs struct {
 	Query  string `json:"query"`
@@ -30,7 +36,7 @@ type searchArgs struct {
 }
 
 // codeSearch walks the workspace and returns bounded file:line matches.
-func (r *ToolRunner) codeSearch(ctx context.Context, argsJSON string) (string, error) {
+func (r *ToolRunner) codeSearch(ctx context.Context, argsJSON string, cfg RunConfig) (string, error) {
 	var a searchArgs
 	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 		return "", err
@@ -45,8 +51,21 @@ func (r *ToolRunner) codeSearch(ctx context.Context, argsJSON string) (string, e
 	}
 	glob := strings.TrimSpace(a.Glob)
 	limit := a.Max
-	if limit <= 0 || limit > MaxSearchResults {
+	if limit <= 0 {
+		limit = cfg.Budget.SearchResults
+	}
+	if limit <= 0 {
 		limit = MaxSearchResults
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	scanCeiling := cfg.Budget.SearchFiles
+	if scanCeiling <= 0 {
+		scanCeiling = 3000
+	}
+	if scanCeiling > MaxSearchScan {
+		scanCeiling = MaxSearchScan
 	}
 	root := r.Workspace
 	if p := strings.TrimSpace(a.Path); p != "" {
@@ -58,6 +77,7 @@ func (r *ToolRunner) codeSearch(ctx context.Context, argsJSON string) (string, e
 	}
 	var out []string
 	var scanned int
+	var truncated bool
 	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d == nil {
 			return nil
@@ -71,10 +91,15 @@ func (r *ToolRunner) codeSearch(ctx context.Context, argsJSON string) (string, e
 			}
 			return nil
 		}
-		if scanned >= 3000 {
+		if scanned >= scanCeiling {
+			truncated = true
 			return filepath.SkipDir
 		}
-		if glob != "" && !matchGlob(glob, d.Name()) {
+		rel, rerr := filepath.Rel(r.Workspace, path)
+		if rerr != nil {
+			rel = d.Name()
+		}
+		if glob != "" && !matchGlob(glob, rel) {
 			return nil
 		}
 		info, ierr := d.Info()
@@ -89,10 +114,6 @@ func (r *ToolRunner) codeSearch(ctx context.Context, argsJSON string) (string, e
 			return nil
 		}
 		scanned++
-		rel, rerr := filepath.Rel(r.Workspace, path)
-		if rerr != nil {
-			rel = path
-		}
 		for i, line := range strings.Split(string(b), "\n") {
 			if re.MatchString(line) {
 				out = append(out, fmt.Sprintf("%s:%d: %s", filepath.ToSlash(rel), i+1, trimLine(line)))
@@ -105,6 +126,9 @@ func (r *ToolRunner) codeSearch(ctx context.Context, argsJSON string) (string, e
 	})
 	if len(out) == 0 {
 		return fmt.Sprintf("无匹配（已扫描 %d 个文件）", scanned), nil
+	}
+	if truncated {
+		return fmt.Sprintf("%d 个匹配（扫描 %d 个文件，已达扫描上限 %d：缩小 path 或 glob 后重试）\n%s", len(out), scanned, scanCeiling, strings.Join(out, "\n")), nil
 	}
 	return fmt.Sprintf("%d 个匹配（扫描 %d 个文件）\n%s", len(out), scanned, strings.Join(out, "\n")), nil
 }
@@ -203,6 +227,10 @@ func (r *ToolRunner) fileEdit(argsJSON string) (string, error) {
 	if err := os.WriteFile(full, []byte(updated), 0o644); err != nil {
 		return "", err
 	}
+	// The edit invalidates the index entry for this file. Marking it is enough: the next graph
+	// query re-parses the marked files rather than rebuilding the whole workspace, so the answer a
+	// dependency question gives after an edit describes the edited code.
+	r.Graph.MarkDirty(filepath.ToSlash(a.Path))
 	return fmt.Sprintf("edited %s (%d occurrence%s)", filepath.ToSlash(a.Path), n, plural(n)), nil
 }
 
@@ -272,16 +300,102 @@ func buildMatcher(query string, regex, ignoreCase bool) (*regexp.Regexp, error) 
 	return regexp.Compile(pattern)
 }
 
-func matchGlob(glob, name string) bool {
+// exact case where a bounded search matters most.
+func matchGlob(glob, rel string) bool {
 	glob = strings.ToLower(strings.TrimSpace(glob))
-	name = strings.ToLower(name)
-	if glob == "*" || glob == "" {
+	rel = strings.ToLower(filepath.ToSlash(rel))
+	if glob == "" || glob == "*" {
 		return true
 	}
-	if strings.HasPrefix(glob, "*") {
-		return strings.HasSuffix(name, strings.TrimPrefix(glob, "*"))
+	if !strings.Contains(glob, "/") {
+		return globSegment(glob, path.Base(rel))
 	}
-	return glob == name
+	return globSegments(strings.Split(glob, "/"), strings.Split(rel, "/"))
+}
+
+func globSegments(pattern, parts []string) bool {
+	if len(pattern) == 0 {
+		return len(parts) == 0
+	}
+	if pattern[0] == "**" {
+		if len(pattern) == 1 {
+			return true
+		}
+		for i := 0; i <= len(parts); i++ {
+			if globSegments(pattern[1:], parts[i:]) {
+				return true
+			}
+		}
+		return false
+	}
+	if len(parts) == 0 {
+		return false
+	}
+	if !globSegment(pattern[0], parts[0]) {
+		return false
+	}
+	return globSegments(pattern[1:], parts[1:])
+}
+
+func globSegment(pattern, name string) bool {
+	if pattern == "" {
+		return name == ""
+	}
+	if pattern[0] == '*' {
+		for i := 0; i <= len(name); i++ {
+			if globSegment(pattern[1:], name[i:]) {
+				return true
+			}
+		}
+		return false
+	}
+	if name == "" {
+		return false
+	}
+	if pattern[0] != '?' && pattern[0] != name[0] {
+		return false
+	}
+	return globSegment(pattern[1:], name[1:])
+}
+
+// codeGraph answers the question code_search cannot: who depends on a symbol. The index is
+// heuristic (parsed, not type-checked), so the tool reports that rather than presenting an edge as a
+// verified fact.
+func (r *ToolRunner) codeGraph(argsJSON string) (string, error) {
+	if r.Graph == nil {
+		return "", fmt.Errorf("code_graph: no symbol index for this workspace")
+	}
+	// A query that follows an edit has to see the edit. Only the marked files are re-parsed, so this
+	// is the cost of the change the model made, not the cost of the repository.
+	if r.Graph.Dirty() > 0 {
+		r.Graph.Refresh(r.Workspace)
+	}
+	var a struct {
+		Mode  string `json:"mode"`
+		Query string `json:"query"`
+		Depth int    `json:"depth"`
+		Limit int    `json:"limit"`
+	}
+	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
+		return "", err
+	}
+	mode := strings.ToLower(strings.TrimSpace(a.Mode))
+	if mode == "" {
+		mode = "definition"
+	}
+	depth := a.Depth
+	if depth <= 0 || depth > 4 {
+		depth = 2
+	}
+	limit := a.Limit
+	if limit <= 0 || limit > 100 {
+		limit = 40
+	}
+	query := strings.TrimSpace(a.Query)
+	if query == "" && mode != "stats" && mode != "cycles" {
+		return "", fmt.Errorf("code_graph: query required for mode %q", mode)
+	}
+	return r.Graph.Render(mode, query, depth, limit), nil
 }
 
 func looksBinary(b []byte) bool {
