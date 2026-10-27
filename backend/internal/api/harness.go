@@ -301,7 +301,9 @@ func (s *Server) repoProfile(workspace string) *codectx.Profile {
 	if !envFlag("CLAWMIND_CODE_PROFILE", true) {
 		return nil
 	}
-	return codectx.Detect(workspace)
+	// The profile is read through the cache: the classifier runs on every turn, and a walk of a
+	// large repository per message is the cost the cache exists to remove.
+	return s.CodeCache.Detect(workspace)
 }
 
 // envFlag reads a boolean environment flag.
