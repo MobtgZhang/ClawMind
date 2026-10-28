@@ -172,6 +172,16 @@ docker compose up --build
 
 前端 <http://localhost:8081>，后端 `:8080`，数据在 `clawmind-data` 卷。
 
+镜像在构建期走 `goproxy.cn` 与 `registry.npmmirror.com`（`proxy.golang.org` 在部分网络下不可达）。
+需要换源时用环境变量覆盖：
+
+```bash
+GOPROXY=https://proxy.golang.org,direct NPM_REGISTRY=https://registry.npmjs.org docker compose up --build
+```
+
+模型与密钥在**设置页**里配置（写入 `.clawmind/config.json`）。该目录与数据库同在 `clawmind-data` 卷
+（`CLAWMIND_DIR=/data/.clawmind`），所以 `docker compose down` 重建容器后设置不会丢。
+
 ## 文档
 
 | 文档 | 内容 |

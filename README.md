@@ -172,6 +172,17 @@ docker compose up --build
 
 Frontend on <http://localhost:8081>, backend on `:8080`, data in the `clawmind-data` volume.
 
+Images build against `goproxy.cn` and `registry.npmmirror.com` (`proxy.golang.org` is unreachable on
+some networks). Override the mirrors with environment variables:
+
+```bash
+GOPROXY=https://proxy.golang.org,direct NPM_REGISTRY=https://registry.npmjs.org docker compose up --build
+```
+
+Model and API key are configured in the **settings page** (written to `.clawmind/config.json`). That
+directory shares the `clawmind-data` volume with the database (`CLAWMIND_DIR=/data/.clawmind`), so
+settings survive `docker compose down` and image rebuilds.
+
 ## Docs
 
 | Document | Contents |
