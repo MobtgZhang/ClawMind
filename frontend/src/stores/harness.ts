@@ -28,6 +28,24 @@ function emptyView(projectId: string): HarnessView {
   };
 }
 
+/** 后端对"没有内容"的字段返回 null；直接展开会用 null 覆盖默认空数组，渲染 `.length` 时崩溃。 */
+function normalizeView(data: unknown, projectId: string): HarnessView {
+  if (!data || typeof data !== "object") return emptyView(projectId);
+  const d = data as Partial<HarnessView>;
+  return {
+    projectId: d.projectId || projectId,
+    dir: typeof d.dir === "string" ? d.dir : "",
+    files: d.files && typeof d.files === "object" ? d.files : {},
+    alwaysOn: asArray<string>(d.alwaysOn),
+    alwaysOnChars: typeof d.alwaysOnChars === "number" ? d.alwaysOnChars : 0,
+    skills: asArray(d.skills),
+    scripts: asArray(d.scripts),
+    problems: asArray<string>(d.problems),
+    lessons: asArray(d.lessons),
+    entries: asArray(d.entries),
+  };
+}
+
 export const useHarnessStore = defineStore("harness", () => {
   const view = ref<HarnessView>(emptyView(""));
   const rounds = ref<HarnessRound[]>([]);
@@ -55,18 +73,25 @@ export const useHarnessStore = defineStore("harness", () => {
 
   async function refresh(projectId: string) {
     loading.value = true;
+    lastError.value = null;
     try {
       const data = await api<HarnessView>(
         `/api/harness?projectId=${encodeURIComponent(projectId)}`
       );
-      view.value = data && typeof data === "object" ? { ...emptyView(projectId), ...data } : emptyView(projectId);
-      rounds.value = asArray<HarnessRound>(
-        await api<HarnessRound[]>(`/api/harness/rounds?projectId=${encodeURIComponent(projectId)}`)
-      );
+      view.value = normalizeView(data, projectId);
     } catch (err) {
       lastError.value = (err as Error).message || "读取 harness 失败";
     } finally {
       loading.value = false;
+    }
+    // rounds 端点只在演化引擎开启时注册（后端 harnessRoutes 的 if s.Harness == nil 门控）；
+    // 引擎关闭时它 404，这不是错误，只是没有轮次记录。
+    try {
+      rounds.value = asArray<HarnessRound>(
+        await api<HarnessRound[]>(`/api/harness/rounds?projectId=${encodeURIComponent(projectId)}`)
+      );
+    } catch {
+      rounds.value = [];
     }
   }
 
