@@ -1,17 +1,18 @@
 <script setup lang="ts">
 import { ref } from "vue";
 import { useChatStore } from "@/stores/chat";
+import Icon from "./Icon.vue";
 
 const store = useChatStore();
-const projectsOpen = ref(true);
-const skillsOpen = ref(true);
-const chatsOpen = ref(true);
+const skillsOpen = ref(false);
 const skillFileInput = ref<HTMLInputElement | null>(null);
 
 defineEmits<{
   (e: "open-settings"): void;
   (e: "open-harness"): void;
   (e: "open-plugins"): void;
+  (e: "open-code"): void;
+  (e: "open-search"): void;
 }>();
 
 function onNewProject() {
@@ -44,21 +45,23 @@ function onNewSkill() {
     window.alert((e as Error).message || "创建失败");
   });
 }
+
+function filterRow(label: string, value: string) {
+  return { label, value, active: store.projectFilter === value };
+}
+const filters = [
+  filterRow("全部对话", "all"),
+  filterRow("未归类", "unassigned"),
+];
 </script>
 
 <template>
-  <aside
-    class="flex h-full w-[272px] shrink-0 flex-col border-r border-ink/10 bg-surface-muted/80"
-  >
-    <div class="flex items-center gap-2.5 px-3 py-3">
-      <img
-        src="/logo.svg"
-        width="32"
-        height="32"
-        class="h-8 w-8 shrink-0 rounded-lg"
-        alt="ClawMind"
-      />
-      <span class="font-semibold tracking-tight text-ink">ClawMind</span>
+  <aside class="side">
+    <div class="side__head">
+      <span class="side__brand">
+        <span class="cm-mark h-7 w-7"><Icon name="code" size="sm" /></span>
+        ClawMind
+      </span>
     </div>
 
     <input
@@ -69,243 +72,170 @@ function onNewSkill() {
       @change="onSkillFile"
     />
 
-    <div class="flex-1 overflow-y-auto px-2 pb-2">
-      <!-- 项目：仅新建与筛选 -->
-      <button
-        type="button"
-        class="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-xs font-semibold uppercase tracking-wide text-ink-muted hover:bg-ink/5"
-        @click="projectsOpen = !projectsOpen"
-      >
+    <button type="button" class="nav-item" @click="store.newSession()">
+      <Icon name="new-chat" />
+      <span>新对话</span>
+    </button>
+    <button type="button" class="nav-item" @click="$emit('open-search')">
+      <Icon name="search" />
+      <span>搜索聊天</span>
+    </button>
+    <button type="button" class="nav-item" @click="$emit('open-settings')">
+      <Icon name="settings" />
+      <span>设置</span>
+    </button>
+    <button type="button" class="nav-item" @click="$emit('open-plugins')">
+      <Icon name="layers" />
+      <span>插件设置</span>
+    </button>
+    <button type="button" class="nav-item" @click="$emit('open-harness')">
+      <Icon name="bolt" />
+      <span>自进化 Harness</span>
+    </button>
+    <button type="button" class="nav-item" @click="triggerSkillImport">
+      <Icon name="attach" />
+      <span>导入技能</span>
+    </button>
+    <button type="button" class="nav-item" @click="$emit('open-code')">
+      <Icon name="code" />
+      <span>代码工作区</span>
+    </button>
+
+    <div class="side__list">
+      <!-- 项目筛选 -->
+      <div class="side__label">
         项目
-        <span class="text-ink-muted/60">{{ projectsOpen ? "−" : "+" }}</span>
-      </button>
-      <div v-show="projectsOpen" class="mb-3 mt-1 space-y-0.5 pl-1">
         <button
           type="button"
-          class="w-full truncate rounded-lg px-3 py-2 text-left text-sm transition-colors"
-          :class="
-            store.projectFilter === 'all'
-              ? 'bg-ink/10 text-ink'
-              : 'text-ink-muted hover:bg-ink/5 hover:text-ink'
-          "
-          @click="store.setProjectFilter('all')"
-        >
-          全部对话
-        </button>
-        <button
-          type="button"
-          class="w-full truncate rounded-lg px-3 py-2 text-left text-sm transition-colors"
-          :class="
-            store.projectFilter === 'unassigned'
-              ? 'bg-ink/10 text-ink'
-              : 'text-ink-muted hover:bg-ink/5 hover:text-ink'
-          "
-          @click="store.setProjectFilter('unassigned')"
-        >
-          未归类
-        </button>
-        <button
-          type="button"
-          class="mb-1 w-full rounded-lg border border-dashed border-ink/20 px-3 py-2 text-left text-xs text-ink-muted hover:bg-ink/5 hover:text-ink"
+          class="icon-btn icon-btn--sm"
+          title="新建项目"
+          aria-label="新建项目"
           @click="onNewProject"
         >
-          + 新建项目
+          <Icon name="plus" size="sm" />
         </button>
-        <ul class="space-y-0.5">
-          <li v-for="p in store.projects ?? []" :key="p.id">
-            <button
-              type="button"
-              class="w-full truncate rounded-lg px-3 py-2 text-left text-sm transition-colors"
-              :class="
-                store.projectFilter === p.id
-                  ? 'bg-ink/10 text-ink'
-                  : 'text-ink-muted hover:bg-ink/5 hover:text-ink'
-              "
-              :title="p.title"
-              @click="store.setProjectFilter(p.id)"
-            >
-              {{ p.title }}
-            </button>
-          </li>
-        </ul>
+      </div>
+      <div
+        v-for="f in filters"
+        :key="f.value"
+        class="row"
+        :class="{ 'is-current': store.projectFilter === f.value }"
+      >
+        <button type="button" class="row__open" @click="store.setProjectFilter(f.value)">
+          {{ f.label }}
+        </button>
+      </div>
+      <div
+        v-for="p in store.projects ?? []"
+        :key="p.id"
+        class="row"
+        :class="{ 'is-current': store.projectFilter === p.id }"
+      >
+        <button type="button" class="row__open" :title="p.title" @click="store.setProjectFilter(p.id)">
+          <Icon name="folder" size="sm" class="mr-1 inline-block align-[-2px]" />
+          {{ p.title }}
+        </button>
       </div>
 
-      <!-- 技能：导入 + 新建 -->
-      <button
-        type="button"
-        class="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-xs font-semibold uppercase tracking-wide text-ink-muted hover:bg-ink/5"
-        @click="skillsOpen = !skillsOpen"
-      >
+      <!-- 技能 -->
+      <div class="side__label">
         技能
-        <span class="text-ink-muted/60">{{ skillsOpen ? "−" : "+" }}</span>
-      </button>
-      <div v-show="skillsOpen" class="mb-3 mt-1 space-y-1 pl-1">
-        <div class="flex gap-1 px-1">
-          <button
-            type="button"
-            class="flex-1 rounded-lg border border-ink/15 px-2 py-1.5 text-xs text-ink hover:bg-ink/5"
-            @click="triggerSkillImport"
-          >
-            导入
-          </button>
-          <button
-            type="button"
-            class="flex-1 rounded-lg border border-ink/15 px-2 py-1.5 text-xs text-ink hover:bg-ink/5"
-            @click="onNewSkill"
-          >
-            新建
-          </button>
-        </div>
-        <p class="px-2 text-[10px] leading-snug text-ink-muted">
-          导入为 OpenAI 格式 JSON（含 <code class="rounded bg-surface-muted px-0.5">tools</code> 数组）；新建写入
-          <code class="rounded bg-surface-muted px-0.5">.clawmind/skills.json</code>。内置原子工具始终可用。
-        </p>
-        <p v-if="(store.skills ?? []).length === 0" class="px-3 py-1 text-xs text-ink-muted">暂无扩展技能</p>
-        <ul v-else class="max-h-48 space-y-1 overflow-y-auto">
-          <li
-            v-for="sk in store.skills ?? []"
-            :key="sk.name"
-            class="rounded-lg px-3 py-2 text-sm text-ink-muted"
-            :title="sk.description"
-          >
-            <span class="font-medium text-ink">{{ sk.name }}</span>
-            <span v-if="sk.description" class="mt-0.5 line-clamp-2 block text-xs opacity-80">{{
-              sk.description
-            }}</span>
-          </li>
-        </ul>
-      </div>
-
-      <!-- 历史对话 -->
-      <button
-        type="button"
-        class="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-xs font-semibold uppercase tracking-wide text-ink-muted hover:bg-ink/5"
-        @click="chatsOpen = !chatsOpen"
-      >
-        历史对话
-        <span class="text-ink-muted/60">{{ chatsOpen ? "−" : "+" }}</span>
-      </button>
-      <div v-show="chatsOpen" class="mt-1 space-y-0.5">
         <button
           type="button"
-          class="mb-1 flex w-full items-center gap-2 rounded-lg border border-ink/15 bg-surface px-3 py-2.5 text-left text-sm text-ink hover:bg-surface-muted"
-          @click="store.newSession()"
+          class="icon-btn icon-btn--sm"
+          title="新建技能"
+          aria-label="新建技能"
+          @click="onNewSkill"
         >
-          <span class="text-lg leading-none">+</span>
-          新对话
+          <Icon name="plus" size="sm" />
         </button>
-        <ul class="space-y-0.5">
-          <li v-for="s in store.sessions ?? []" :key="s.id">
-            <div class="flex items-center gap-1">
-              <button
-                type="button"
-                class="min-w-0 flex-1 truncate rounded-lg px-3 py-2 text-left text-sm transition-colors"
-                :class="
-                  s.id === store.currentSessionId
-                    ? 'bg-ink/10 text-ink'
-                    : 'text-ink-muted hover:bg-ink/5 hover:text-ink'
-                "
-                :title="s.title"
-                @click="store.selectSession(s.id)"
-              >
-                {{ s.title || "未命名" }}
-              </button>
-              <button
-                type="button"
-                class="shrink-0 rounded p-1.5 text-base leading-none text-ink-muted/80 hover:bg-ink/10 hover:text-ink"
-                title="删除对话"
-                @click.prevent.stop="store.deleteSession(s.id)"
-              >
-                ×
-              </button>
+      </div>
+      <button type="button" class="nav-item" @click="skillsOpen = !skillsOpen">
+        <Icon name="box" />
+        <span>已安装 {{ (store.skills ?? []).length }}</span>
+        <Icon name="chevron" size="sm" class="chev" :class="{ 'is-closed': !skillsOpen }" />
+      </button>
+      <template v-if="skillsOpen">
+        <p class="side__note">
+          导入为 OpenAI 格式 JSON（含 <code class="mono">tools</code> 数组）；新建写入
+          <code class="mono">.clawmind/skills.json</code>。内置原子工具始终可用。
+        </p>
+        <div
+          v-for="sk in store.skills ?? []"
+          :key="sk.name"
+          class="row px-2 py-1"
+          :title="sk.description"
+        >
+          <div class="min-w-0 px-2">
+            <div class="truncate text-sm font-medium text-ink">{{ sk.name }}</div>
+            <div v-if="sk.description" class="truncate text-xs text-ink-muted">
+              {{ sk.description }}
             </div>
-          </li>
-        </ul>
+          </div>
+        </div>
+        <p v-if="(store.skills ?? []).length === 0" class="side__note">暂无扩展技能</p>
+      </template>
+
+      <!-- 历史对话 -->
+      <div class="side__label">对话</div>
+      <div
+        v-for="s in store.sessions ?? []"
+        :key="s.id"
+        class="row"
+        :class="{ 'is-current': s.id === store.currentSessionId }"
+      >
+        <span
+          v-if="s.id === store.currentSessionId && store.sending"
+          class="row__live"
+          aria-hidden="true"
+        />
+        <button type="button" class="row__open" :title="s.title" @click="store.selectSession(s.id)">
+          {{ s.title || "未命名" }}
+        </button>
+        <button
+          type="button"
+          class="row__more"
+          title="删除对话"
+          aria-label="删除对话"
+          @click.prevent.stop="store.deleteSession(s.id)"
+        >
+          <Icon name="trash" size="sm" />
+        </button>
       </div>
     </div>
 
-    <div class="border-t border-ink/10 p-2">
-      <div class="flex w-full items-center justify-between px-1">
+    <div class="side__foot">
+      <button
+        type="button"
+        class="status-card"
+        title="打开设置"
+        @click="$emit('open-settings')"
+      >
+        <span class="cm-mark h-8 w-8"><Icon name="cpu" size="sm" /></span>
+        <span class="status-card__text">
+          <b>{{ store.serverSettings.openaiModel || "未配置模型" }}</b>
+          <span>设置模型与密钥</span>
+        </span>
+        <Icon name="sliders" size="sm" class="ml-auto text-ink-muted" />
+      </button>
+      <div class="flex items-center justify-between px-1 pt-1">
         <button
           type="button"
-          class="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-ink-muted transition hover:bg-ink/10 hover:text-ink"
-          title="Harness（自进化）"
-          aria-label="Harness（自进化）"
-          @click="$emit('open-harness')"
-        >
-          <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M12 3v18" />
-            <path stroke-linecap="round" stroke-linejoin="round" d="M12 8l4-4M12 8L8 4M12 16l4 4M12 16l-4 4" />
-          </svg>
-        </button>
-        <button
-          type="button"
-          class="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-ink-muted transition hover:bg-ink/10 hover:text-ink"
-          title="插件层与记忆"
-          aria-label="插件层与记忆"
-          @click="$emit('open-plugins')"
-        >
-          <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M12 3l8 4.5-8 4.5-8-4.5 8-4.5z" />
-            <path stroke-linecap="round" stroke-linejoin="round" d="M4 12.5l8 4.5 8-4.5" />
-            <path stroke-linecap="round" stroke-linejoin="round" d="M4 17l8 4.5 8-4.5" />
-          </svg>
-        </button>
-        <button
-          type="button"
-          class="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-ink-muted transition hover:bg-ink/10 hover:text-ink"
-          title="设置"
-          aria-label="设置"
-          @click="$emit('open-settings')"
-        >
-          <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-            <path
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"
-            />
-            <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-          </svg>
-        </button>
-        <button
-          type="button"
-          class="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-ink-muted transition hover:bg-ink/10 hover:text-ink"
+          class="icon-btn"
           :title="store.darkMode ? '切换为浅色' : '切换为深色'"
           :aria-label="store.darkMode ? '切换为浅色' : '切换为深色'"
           @click="store.setDarkMode(!store.darkMode)"
         >
-          <!-- 深色模式时显示太阳 → 点一下切浅色 -->
-          <svg
-            v-if="store.darkMode"
-            class="h-5 w-5"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2"
-            aria-hidden="true"
-          >
-            <circle cx="12" cy="12" r="4" />
-            <path
-              stroke-linecap="round"
-              d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32l1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"
-            />
-          </svg>
-          <!-- 浅色模式时显示月亮 → 点一下切深色 -->
-          <svg
-            v-else
-            class="h-5 w-5"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2"
-            aria-hidden="true"
-          >
-            <path
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"
-            />
-          </svg>
+          <Icon :name="store.darkMode ? 'sun' : 'moon'" />
+        </button>
+        <button
+          type="button"
+          class="icon-btn"
+          title="设置"
+          aria-label="设置"
+          @click="$emit('open-settings')"
+        >
+          <Icon name="settings" />
         </button>
       </div>
     </div>
