@@ -2,12 +2,9 @@
 import { computed, ref, watch } from "vue";
 import type { Message, Part, PartType } from "@/types/chat";
 import MarkdownMessage from "./MarkdownMessage.vue";
+import Icon from "./Icon.vue";
 import { useChatStore } from "@/stores/chat";
-import {
-  parentKeyForMessage,
-  userTurnVersions,
-  userVersionIndex,
-} from "@/lib/thread";
+import { parentKeyForMessage, userTurnVersions, userVersionIndex } from "@/lib/thread";
 
 const props = defineProps<{ message: Message }>();
 const store = useChatStore();
@@ -21,26 +18,6 @@ watch(
     editing.value = false;
   }
 );
-
-const assistantAvatar = "/clawmind-assistant.png";
-const userAvatar = "/clawmind-user.png";
-
-function partLabel(t: PartType): string {
-  switch (t) {
-    case "task_flow":
-      return "任务流程";
-    case "thinking":
-      return "思考过程";
-    case "graph":
-      return "执行图";
-    case "reasoning":
-      return "评审";
-    case "text":
-      return "回答";
-    default:
-      return t;
-  }
-}
 
 const isStreamingThis = computed(
   () => props.message.role === "assistant" && store.streamingMessageId === props.message.id
@@ -63,30 +40,15 @@ const liveSections = computed(() => {
 
 const liveTools = computed(() => store.streamingToolSteps[props.message.id] ?? []);
 
-/** 任务流程流式：仅在 partIndex 0 输出时展开，进入思考后折叠 */
+/** 任务流程流式：仅在 partIndex 0 输出时展开，进入后续段后折叠 */
 function taskFlowStreamOpen(): boolean {
   if (!isStreamingThis.value || !liveSections.value) return false;
   return !liveSections.value.some((s) => s.index > 0);
 }
 
-/** 思考流式：思考段开始后、回答/工具前展开 */
-function thinkingStreamOpen(): boolean {
-  if (!isStreamingThis.value || !liveSections.value) return false;
-  if (liveTools.value.length > 0) return false;
-  const textSec = liveSections.value.find((s) => s.type === "text");
-  if (textSec && textSec.text.length > 0) return false;
-  return liveSections.value.some((s) => s.type === "thinking");
-}
-
 function sectionTaskFlowOpen(sec: { type: PartType }): boolean | undefined {
   if (sec.type !== "task_flow") return undefined;
   if (isStreamingThis.value) return taskFlowStreamOpen();
-  return undefined;
-}
-
-function sectionThinkingOpen(sec: { type: PartType }): boolean | undefined {
-  if (sec.type !== "thinking") return undefined;
-  if (isStreamingThis.value) return thinkingStreamOpen();
   return undefined;
 }
 
@@ -130,6 +92,98 @@ const persistedBlocks = computed(() => {
   return blocks;
 });
 
+/* ---------------------------------------------------------------- 工具步骤的展示增强（代码工程） */
+
+/** 工具名 → sprite 图标 */
+const TOOL_ICONS: Record<string, string> = {
+  code_search: "search",
+  repo_tree: "folder",
+  file_read: "eye",
+  file_write: "notebook-pen",
+  file_edit: "edit",
+  shell_exec: "tool",
+  run_tests: "check",
+  web_fetch: "external",
+  task_plan: "layers",
+  task_summary: "report",
+  load_skill: "box",
+  delegate: "experts",
+  code_graph: "boxes",
+};
+
+function toolIcon(name: string): string {
+  return TOOL_ICONS[name] ?? "tool";
+}
+
+/** 从工具参数里提取一个可读预览（路径 / 查询 / 命令） */
+function toolPreview(name: string, args: string): string {
+  let obj: Record<string, unknown> = {};
+  try {
+    obj = JSON.parse(args || "{}") as Record<string, unknown>;
+  } catch {
+    return (args || "").slice(0, 160);
+  }
+  const pick = (...keys: string[]) => {
+    for (const k of keys) {
+      const v = obj[k];
+      if (typeof v === "string" && v) return v;
+    }
+    return "";
+  };
+  switch (name) {
+    case "file_read":
+    case "file_write":
+    case "file_edit":
+      return pick("path", "file", "filename") || "—";
+    case "code_search":
+      return pick("query", "pattern") || "—";
+    case "code_graph":
+      return pick("symbol", "query", "mode") || "—";
+    case "repo_tree":
+      return pick("path") || "仓库结构";
+    case "run_tests":
+      return pick("command") || "推断的测试命令";
+    case "shell_exec":
+      return pick("command", "cmd") || "—";
+    case "web_fetch":
+      return pick("url") || "—";
+    case "load_skill":
+      return pick("name", "skill") || "—";
+    case "delegate":
+      return pick("task", "prompt") || "—";
+    default:
+      return pick("path", "query", "command", "url", "name") || (args || "").slice(0, 120);
+  }
+}
+
+type ToolState = "running" | "done" | "error";
+
+/** 工具状态：无结果 = 运行中；结果含失败标记 = error */
+function toolState(step: { result?: string }): ToolState {
+  if (step.result === undefined) return "running";
+  const r = step.result;
+  if (/^\s*(error|失败|exit code [1-9])/i.test(r) || /\bFAIL\b/.test(r)) return "error";
+  return "done";
+}
+
+const TOOL_STATE_BADGE: Record<ToolState, { cls: string; text: string }> = {
+  running: { cls: "badge--accent badge--live", text: "运行中" },
+  done: { cls: "badge--ok", text: "完成" },
+  error: { cls: "badge--danger", text: "失败" },
+};
+
+function toolBadge(step: { name: string; result?: string }) {
+  if (step.name === "run_tests" && step.result !== undefined) {
+    const failed = toolState(step) === "error";
+    return failed
+      ? { cls: "badge--danger", text: "测试未通过" }
+      : { cls: "badge--ok", text: "测试通过" };
+  }
+  return TOOL_STATE_BADGE[toolState(step)];
+}
+
+/* ---------------------------------------------------------------- 用户消息：复制 / 编辑 / 版本 */
+
 function userPlainText(m: Message): string {
   return m.parts
     .filter((p) => p.type === "text" || p.type === "code")
@@ -143,9 +197,7 @@ const userText = computed(() => {
   return userPlainText(m) || m.parts[0]?.text || "";
 });
 
-const versionList = computed(() =>
-  userTurnVersions([...store.messages], props.message)
-);
+const versionList = computed(() => userTurnVersions([...store.messages], props.message));
 const vIndex0 = computed(() => userVersionIndex(versionList.value, props.message));
 const versionDisplayX = computed(() => vIndex0.value + 1);
 const versionCount = computed(() => versionList.value.length);
@@ -189,10 +241,12 @@ function nextUserVersion() {
   void store.selectBranchUserVersion(branchParentKey.value, list[i + 1]!.id);
 }
 
+/* ---------------------------------------------------------------- 助手消息：复制 / 重新生成 / 导出 */
+
 function assistantExportMarkdown(m: Message): string {
   const chunks: string[] = [];
   for (const p of m.parts) {
-    if (p.type === "text" || p.type === "thinking" || p.type === "task_flow" || p.type === "graph") {
+    if (p.type === "text" || p.type === "task_flow" || p.type === "graph") {
       if (p.text) chunks.push(p.text);
     } else if (p.type === "code") {
       chunks.push("```" + (p.language || "") + "\n" + (p.text || "") + "\n```");
@@ -225,343 +279,247 @@ function onRegenerateAssistant() {
   void store.regenerateAssistant(props.message.id);
 }
 
-const iconBtn =
-  "inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-ink-muted transition hover:bg-ink/[0.08] hover:text-ink disabled:pointer-events-none disabled:opacity-30 dark:hover:bg-ink/10";
-
 const fallbackStreamText = computed(() => {
   if (!isStreamingThis.value) return "";
-  const buf = store.streamingBuffers[props.message.id];
-  if (buf !== undefined && buf !== "") return buf;
-  return "";
+  return store.streamingBuffers[props.message.id] ?? "";
 });
 
-const summaryCls =
-  "flex cursor-pointer list-none items-center gap-2 py-2 pl-2 pr-3 text-[11px] font-semibold uppercase tracking-wide text-ink-muted hover:bg-ink/[0.04] [&::-webkit-details-marker]:hidden";
+/** 流式正文的最后一段加打字光标 */
+function isLastTextSection(idx: number): boolean {
+  if (!liveSections.value) return false;
+  const textIdxs = liveSections.value.filter((s) => s.type === "text").map((s) => s.index);
+  return textIdxs.length > 0 && textIdxs[textIdxs.length - 1] === idx;
+}
+
+const sectionLabel: Record<string, string> = {
+  task_flow: "任务流程",
+  thinking: "思考",
+  graph: "执行图",
+  reasoning: "评审",
+  text: "回答",
+};
 </script>
 
 <template>
-  <!-- 用户：气泡 + 外侧右下复制/编辑；编辑态框内取消/发送；多版本时 < X/Y > -->
-  <div v-if="message.role === 'user'" class="flex w-full items-end justify-end gap-2.5 py-2.5">
-    <div class="flex min-w-0 max-w-[min(100%,85%)] flex-col items-end gap-1.5">
-      <div
-        class="w-full rounded-[1.2rem] bg-ink/[0.08] px-4 py-2.5 text-[15px] leading-relaxed text-ink dark:bg-ink/[0.14]"
-      >
-        <template v-if="editing">
-          <textarea
-            v-model="draft"
-            rows="3"
-            class="w-full resize-y rounded-lg border border-ink/15 bg-surface px-3 py-2 text-[15px] text-ink outline-none focus:border-accent/50 dark:border-ink/25"
-          />
-          <div class="mt-2 flex justify-end gap-2">
-            <button
-              type="button"
-              class="rounded-lg px-3 py-1.5 text-xs font-medium text-ink-muted hover:bg-ink/10"
-              @click="cancelEditUser"
-            >
-              取消
-            </button>
-            <button
-              type="button"
-              class="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white hover:opacity-90 disabled:opacity-40"
-              :disabled="store.sending"
-              @click="submitEditUser"
-            >
-              发送
-            </button>
-          </div>
-        </template>
-        <div v-else class="whitespace-pre-wrap break-words">{{ userText }}</div>
-      </div>
-      <div class="flex flex-wrap items-center justify-end gap-0.5 pr-0.5">
-        <button
-          v-if="!editing"
-          type="button"
-          :class="iconBtn"
-          title="复制"
-          aria-label="复制提问"
-          @click="copyUserText"
-        >
-          <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-            <rect x="9" y="9" width="11" height="11" rx="2" />
-            <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" />
-          </svg>
-        </button>
-        <button
-          v-if="!editing"
-          type="button"
-          :class="iconBtn"
-          title="修改"
-          aria-label="修改提问"
-          @click="startEditUser"
-        >
-          <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-            <path d="M12 20h9M16.5 3.5a2.12 2.12 0 013 3L8 18l-4 1 1-4L16.5 3.5z" />
-          </svg>
-        </button>
-        <template v-if="!editing && versionCount > 1">
+  <!-- 用户 -->
+  <div v-if="message.role === 'user'" class="you">
+    <div class="you__bubble">
+      <template v-if="editing">
+        <textarea
+          v-model="draft"
+          rows="3"
+          class="input input--area w-full"
+          @keydown.esc="cancelEditUser"
+        />
+        <div class="mt-2 flex justify-end gap-2">
+          <button type="button" class="btn btn--ghost btn--sm" @click="cancelEditUser">取消</button>
           <button
             type="button"
-            :class="iconBtn"
-            :disabled="versionDisplayX <= 1"
-            aria-label="上一版本"
-            @click="prevUserVersion"
+            class="btn btn--primary btn--sm"
+            :disabled="store.sending"
+            @click="submitEditUser"
           >
-            <span class="text-sm font-medium">&lt;</span>
+            发送
           </button>
-          <span class="min-w-[3rem] select-none text-center text-xs tabular-nums text-ink-muted">
-            {{ versionDisplayX }} / {{ versionCount }}
-          </span>
-          <button
-            type="button"
-            :class="iconBtn"
-            :disabled="versionDisplayX >= versionCount"
-            aria-label="下一版本"
-            @click="nextUserVersion"
-          >
-            <span class="text-sm font-medium">&gt;</span>
-          </button>
-        </template>
-      </div>
+        </div>
+      </template>
+      <div v-else>{{ userText }}</div>
     </div>
-    <img
-      :src="userAvatar"
-      width="32"
-      height="32"
-      class="mb-0.5 h-8 w-8 shrink-0 rounded-full object-cover ring-1 ring-ink/10"
-      alt=""
-    />
+    <div class="you__actions">
+      <span v-if="!editing && versionCount > 1" class="you__time num">
+        {{ versionDisplayX }} / {{ versionCount }}
+      </span>
+      <button
+        v-if="!editing && versionCount > 1"
+        type="button"
+        class="icon-btn icon-btn--sm"
+        :disabled="versionDisplayX <= 1"
+        aria-label="上一版本"
+        @click="prevUserVersion"
+      >
+        <Icon name="chevron" size="sm" class="rotate-90" />
+      </button>
+      <button
+        v-if="!editing && versionCount > 1"
+        type="button"
+        class="icon-btn icon-btn--sm"
+        :disabled="versionDisplayX >= versionCount"
+        aria-label="下一版本"
+        @click="nextUserVersion"
+      >
+        <Icon name="chevron" size="sm" class="-rotate-90" />
+      </button>
+      <button
+        v-if="!editing"
+        type="button"
+        class="icon-btn icon-btn--sm"
+        title="复制"
+        aria-label="复制提问"
+        @click="copyUserText"
+      >
+        <Icon name="copy" size="sm" />
+      </button>
+      <button
+        v-if="!editing"
+        type="button"
+        class="icon-btn icon-btn--sm"
+        title="修改"
+        aria-label="修改提问"
+        @click="startEditUser"
+      >
+        <Icon name="edit" size="sm" />
+      </button>
+    </div>
   </div>
 
   <!-- 助手 -->
-  <div v-else class="w-full py-2.5">
-    <div class="flex gap-3">
-      <img
-        :src="assistantAvatar"
-        width="32"
-        height="32"
-        class="mt-0.5 h-8 w-8 shrink-0 rounded-full object-cover ring-1 ring-ink/10"
-        alt="ClawMind"
-      />
-      <div class="min-w-0 flex-1 space-y-2.5 text-[15px] leading-relaxed text-ink">
-        <template v-if="isStreamingThis && liveSections && liveSections.length > 0">
-          <template v-for="sec in liveSections" :key="'s' + sec.index">
-            <details
-              v-if="sec.type === 'task_flow' || sec.type === 'graph'"
-              class="group/tf rounded-lg border border-ink/10 bg-surface-muted/50 dark:bg-surface-muted/25"
-              :open="sectionTaskFlowOpen(sec) ?? sectionGraphOpen(sec)"
-            >
-              <summary :class="summaryCls">
-                <svg
-                  class="h-3.5 w-3.5 shrink-0 text-ink-muted transition-transform group-open/tf:rotate-90"
-                  viewBox="0 0 24 24"
-                  fill="currentColor"
-                  aria-hidden="true"
-                >
-                  <path d="M8.59 16.59 13.17 12 8.59 7.41 10 6l6 6-6 6-1.41-1.41z" />
-                </svg>
-                {{ partLabel(sec.type) }}
-              </summary>
-              <div class="border-t border-ink/10 px-3 pb-3 pt-2">
-                <MarkdownMessage :source="sec.text" />
-              </div>
-            </details>
-            <details
-              v-else-if="sec.type === 'thinking'"
-              class="group/th rounded-lg border border-ink/10 bg-surface-muted/40 dark:bg-surface-muted/20"
-              :open="sectionThinkingOpen(sec)"
-            >
-              <summary :class="summaryCls">
-                <svg
-                  class="h-3.5 w-3.5 shrink-0 text-ink-muted transition-transform group-open/th:rotate-90"
-                  viewBox="0 0 24 24"
-                  fill="currentColor"
-                  aria-hidden="true"
-                >
-                  <path d="M8.59 16.59 13.17 12 8.59 7.41 10 6l6 6-6 6-1.41-1.41z" />
-                </svg>
-                {{ partLabel(sec.type) }}
-              </summary>
-              <div class="border-t border-ink/10 px-3 pb-3 pt-2">
-                <MarkdownMessage :source="sec.text" />
-              </div>
-            </details>
-            <div v-else-if="sec.type === 'text'" class="min-w-0">
-              <div class="mb-1 text-[11px] font-semibold uppercase tracking-wide text-ink-muted">
-                {{ partLabel(sec.type) }}
-              </div>
+  <div v-else class="answer">
+    <!-- 流式 -->
+    <template v-if="isStreamingThis && liveSections && liveSections.length > 0">
+      <div
+        class="answer__body"
+        :class="{
+          'is-streaming': liveSections.some((s) => s.type === 'text' && s.text.length > 0),
+        }"
+      >
+        <template v-for="sec in liveSections" :key="'s' + sec.index">
+          <details
+            v-if="sec.type === 'task_flow' || sec.type === 'graph' || sec.type === 'thinking'"
+            class="fold"
+            :class="{ 'is-live': sec.type !== 'thinking' }"
+            :open="sectionTaskFlowOpen(sec) ?? sectionGraphOpen(sec)"
+          >
+            <summary>
+              <Icon
+                name="chevron"
+                size="sm"
+                class="chev"
+                :class="{ 'is-closed': !(sectionTaskFlowOpen(sec) ?? sectionGraphOpen(sec)) }"
+              />
+              <span class="fold__title">{{ sectionLabel[sec.type] ?? sec.type }}</span>
+            </summary>
+            <div class="fold__body">
               <MarkdownMessage :source="sec.text" />
             </div>
-            <div
-              v-else
-              class="rounded-lg border border-ink/10 bg-surface-muted/30 px-3 py-2 font-mono text-xs text-ink-muted"
-            >
-              {{ sec.text }}
-            </div>
-          </template>
-          <details
-            v-if="liveTools.length > 0"
-            class="group/to rounded-lg border border-ink/10 bg-surface-muted/40 dark:bg-surface-muted/20"
-            :open="isStreamingThis"
+          </details>
+          <div
+            v-else-if="sec.type === 'text'"
+            class="min-w-0"
+            :class="{ 'answer__last': isLastTextSection(sec.index) }"
           >
-            <summary :class="summaryCls">
-              <svg
-                class="h-3.5 w-3.5 shrink-0 text-ink-muted transition-transform group-open/to:rotate-90"
-                viewBox="0 0 24 24"
-                fill="currentColor"
-              >
-                <path d="M8.59 16.59 13.17 12 8.59 7.41 10 6l6 6-6 6-1.41-1.41z" />
-              </svg>
-              工具执行
+            <MarkdownMessage :source="sec.text" />
+          </div>
+          <pre
+            v-else
+            class="tool__pre"
+          >{{ sec.text }}</pre>
+        </template>
+      </div>
+      <!-- 流式工具步骤 -->
+      <template v-if="liveTools.length > 0">
+        <details
+          v-for="t in liveTools"
+          :key="t.id"
+          class="tool"
+          :data-state="toolState(t)"
+          :open="t.result === undefined"
+        >
+          <summary>
+            <Icon :name="toolIcon(t.name)" size="sm" />
+            <span class="tool__name">{{ t.name }}</span>
+            <span class="tool__preview">{{ toolPreview(t.name, t.args) }}</span>
+            <span class="badge" :class="toolBadge(t).cls">{{ toolBadge(t).text }}</span>
+            <Icon name="chevron" size="sm" class="chev is-closed" />
+          </summary>
+          <div class="tool__body">
+            <div class="tool__label">参数</div>
+            <pre class="tool__pre">{{ t.args || "—" }}</pre>
+            <template v-if="t.result !== undefined">
+              <div class="tool__label">结果</div>
+              <pre class="tool__pre">{{ t.result }}</pre>
+            </template>
+          </div>
+        </details>
+      </template>
+      <div v-else class="answer__wait"><span class="dot-pulse" /></div>
+    </template>
+
+    <MarkdownMessage v-else-if="isStreamingThis && fallbackStreamText" :source="fallbackStreamText" />
+
+    <!-- 持久化 -->
+    <div v-else class="answer__body">
+      <template v-for="(block, bi) in persistedBlocks" :key="bi">
+        <template v-if="block.kind === 'part'">
+          <details
+            v-if="block.part.type === 'task_flow' || block.part.type === 'graph' || block.part.type === 'thinking'"
+            class="fold"
+          >
+            <summary>
+              <Icon name="chevron" size="sm" class="chev is-closed" />
+              <span>{{ sectionLabel[block.part.type] ?? block.part.type }}</span>
             </summary>
-            <div class="border-t border-ink/10 px-3 pb-3 pt-2">
-              <div
-                v-for="t in liveTools"
-                :key="t.id"
-                class="mb-2 border-l-2 border-accent/35 pl-2 last:mb-0"
-              >
-                <div class="font-mono text-xs text-accent">{{ t.name }}</div>
-                <pre class="mt-1 max-h-28 overflow-auto text-[11px] text-ink-muted">{{ t.args }}</pre>
-                <pre
-                  v-if="t.result !== undefined"
-                  class="mt-1 max-h-36 overflow-auto rounded-md bg-ink/[0.06] p-2 text-[11px] text-ink dark:bg-ink/10"
-                  >{{ t.result }}</pre
-                >
-              </div>
+            <div class="fold__body">
+              <MarkdownMessage :source="block.part.text || ''" />
+            </div>
+          </details>
+          <div v-else-if="block.part.type === 'text'" class="min-w-0">
+            <MarkdownMessage :source="block.part.text || ''" />
+          </div>
+          <pre v-else class="tool__pre">{{ block.part.name }}({{ block.part.arguments }})</pre>
+        </template>
+        <!-- 工具步骤组 -->
+        <template v-if="block.kind === 'tools'">
+          <details v-for="t in block.steps" :key="t.id" class="tool" :data-state="toolState(t)">
+            <summary>
+              <Icon :name="toolIcon(t.name)" size="sm" />
+              <span class="tool__name">{{ t.name }}</span>
+              <span class="tool__preview">{{ toolPreview(t.name, t.args) }}</span>
+              <span class="badge" :class="toolBadge(t).cls">{{ toolBadge(t).text }}</span>
+              <Icon name="chevron" size="sm" class="chev is-closed" />
+            </summary>
+            <div class="tool__body">
+              <div class="tool__label">参数</div>
+              <pre class="tool__pre">{{ t.args || "—" }}</pre>
+              <template v-if="t.result">
+                <div class="tool__label">结果</div>
+                <pre class="tool__pre">{{ t.result }}</pre>
+              </template>
             </div>
           </details>
         </template>
+      </template>
+    </div>
 
-        <MarkdownMessage
-          v-else-if="isStreamingThis && fallbackStreamText"
-          :source="fallbackStreamText"
-        />
-
-        <template v-else-if="message.role === 'assistant'">
-          <template v-for="(block, bi) in persistedBlocks" :key="bi">
-            <div
-              v-if="block.kind === 'part' && block.part.type === 'code'"
-              class="rounded-lg border border-ink/10 bg-surface-muted/40 px-3 py-2 dark:bg-surface-muted/25"
-            >
-              <div class="mb-1 text-[11px] font-semibold text-ink-muted">代码</div>
-              <MarkdownMessage
-                :source="'```' + (block.part.language || '') + '\n' + (block.part.text || '') + '\n```'"
-              />
-            </div>
-            <details
-              v-else-if="block.kind === 'part' && (block.part.type === 'task_flow' || block.part.type === 'graph')"
-              class="group/tf rounded-lg border border-ink/10 bg-surface-muted/50 dark:bg-surface-muted/25"
-            >
-              <summary :class="summaryCls">
-                <svg
-                  class="h-3.5 w-3.5 shrink-0 text-ink-muted transition-transform group-open/tf:rotate-90"
-                  viewBox="0 0 24 24"
-                  fill="currentColor"
-                >
-                  <path d="M8.59 16.59 13.17 12 8.59 7.41 10 6l6 6-6 6-1.41-1.41z" />
-                </svg>
-                {{ partLabel(block.part.type) }}
-              </summary>
-              <div class="border-t border-ink/10 px-3 pb-3 pt-2">
-                <MarkdownMessage :source="block.part.text || ''" />
-              </div>
-            </details>
-            <details
-              v-else-if="block.kind === 'part' && block.part.type === 'thinking'"
-              class="group/th rounded-lg border border-ink/10 bg-surface-muted/40 dark:bg-surface-muted/20"
-            >
-              <summary :class="summaryCls">
-                <svg
-                  class="h-3.5 w-3.5 shrink-0 text-ink-muted transition-transform group-open/th:rotate-90"
-                  viewBox="0 0 24 24"
-                  fill="currentColor"
-                >
-                  <path d="M8.59 16.59 13.17 12 8.59 7.41 10 6l6 6-6 6-1.41-1.41z" />
-                </svg>
-                {{ partLabel(block.part.type) }}
-              </summary>
-              <div class="border-t border-ink/10 px-3 pb-3 pt-2">
-                <MarkdownMessage :source="block.part.text || ''" />
-              </div>
-            </details>
-            <div v-else-if="block.kind === 'part' && block.part.type === 'text'" class="min-w-0">
-              <MarkdownMessage :source="block.part.text || ''" />
-            </div>
-            <div
-              v-else-if="block.kind === 'part'"
-              class="rounded-lg border border-ink/10 px-3 py-2 font-mono text-xs text-ink-muted"
-            >
-              {{ block.part.name }}({{ block.part.arguments }})
-            </div>
-            <details v-else class="group/to rounded-lg border border-ink/10 bg-surface-muted/40 dark:bg-surface-muted/20">
-              <summary :class="summaryCls">
-                <svg
-                  class="h-3.5 w-3.5 shrink-0 text-ink-muted transition-transform group-open/to:rotate-90"
-                  viewBox="0 0 24 24"
-                  fill="currentColor"
-                >
-                  <path d="M8.59 16.59 13.17 12 8.59 7.41 10 6l6 6-6 6-1.41-1.41z" />
-                </svg>
-                工具执行
-              </summary>
-              <div class="border-t border-ink/10 px-3 pb-3 pt-2">
-                <div
-                  v-for="t in block.steps"
-                  :key="t.id"
-                  class="mb-2 border-l-2 border-accent/35 pl-2 last:mb-0"
-                >
-                  <div class="font-mono text-xs text-accent">{{ t.name }}</div>
-                  <pre class="mt-1 max-h-28 overflow-auto text-[11px] text-ink-muted">{{ t.args }}</pre>
-                  <pre
-                    v-if="t.result"
-                    class="mt-1 max-h-36 overflow-auto rounded-md bg-ink/[0.06] p-2 text-[11px] text-ink dark:bg-ink/10"
-                    >{{ t.result }}</pre
-                  >
-                </div>
-              </div>
-            </details>
-          </template>
-        </template>
-        <div
-          v-if="!isStreamingThis"
-          class="flex flex-wrap items-center gap-0.5 border-t border-ink/10 pt-2 dark:border-ink/15"
-        >
-          <button
-            type="button"
-            :class="iconBtn"
-            title="复制"
-            aria-label="复制回复"
-            @click="copyAssistantMarkdown"
-          >
-            <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-              <rect x="9" y="9" width="11" height="11" rx="2" />
-              <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" />
-            </svg>
-          </button>
-          <button
-            type="button"
-            :class="iconBtn"
-            title="重新生成"
-            aria-label="重新生成"
-            :disabled="store.sending"
-            @click="onRegenerateAssistant"
-          >
-            <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-              <path d="M21 12a9 9 0 11-3-7.5M21 3v6h-6" />
-            </svg>
-          </button>
-          <button
-            type="button"
-            :class="iconBtn"
-            title="导出为 Markdown"
-            aria-label="导出"
-            @click="exportAssistantFile"
-          >
-            <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-              <path d="M12 3v12M8 11l4 4 4-4M5 21h14" />
-            </svg>
-          </button>
-        </div>
-      </div>
+    <!-- 操作条 -->
+    <div v-if="!isStreamingThis" class="answer__actions">
+      <button
+        type="button"
+        class="icon-btn icon-btn--sm"
+        title="复制"
+        aria-label="复制回复"
+        @click="copyAssistantMarkdown"
+      >
+        <Icon name="copy" size="sm" />
+      </button>
+      <button
+        type="button"
+        class="icon-btn icon-btn--sm"
+        title="重新生成"
+        aria-label="重新生成"
+        :disabled="store.sending"
+        @click="onRegenerateAssistant"
+      >
+        <Icon name="refresh" size="sm" />
+      </button>
+      <button
+        type="button"
+        class="icon-btn icon-btn--sm"
+        title="导出为 Markdown"
+        aria-label="导出"
+        @click="exportAssistantFile"
+      >
+        <Icon name="download" size="sm" />
+      </button>
     </div>
   </div>
 </template>
