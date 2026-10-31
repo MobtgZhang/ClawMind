@@ -1,0 +1,62 @@
+/* highlight.js 主题 — 配色对齐 Project Maya 的代码块（两套主题下代码块恒暗）。
+   关键字 #c4a7ff · 字符串 #9ee6b8 · 注释 #7c84ad 斜体 · 数字 #ffc58a · 函数 #82cfff · 属性 #ffd479 · 变量 #ff9ec6 */
+
+.hljs {
+  color: var(--code-ink);
+  background: transparent;
+}
+.hljs-comment,
+.hljs-quote {
+  color: #7c84ad;
+  font-style: italic;
+}
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-literal,
+.hljs-section,
+.hljs-doctag,
+.hljs-name {
+  color: #c4a7ff;
+}
+.hljs-string,
+.hljs-regexp,
+.hljs-addition,
+.hljs-attribute,
+.hljs-meta-string {
+  color: #9ee6b8;
+}
+.hljs-number,
+.hljs-symbol,
+.hljs-bullet,
+.hljs-link,
+.hljs-meta,
+.hljs-template-variable,
+.hljs-variable {
+  color: #ffc58a;
+}
+.hljs-title,
+.hljs-title.function_,
+.hljs-title.class_,
+.hljs-built_in,
+.hljs-class .hljs-title {
+  color: #82cfff;
+}
+.hljs-attr,
+.hljs-selector-attr,
+.hljs-selector-class,
+.hljs-selector-id,
+.hljs-property {
+  color: #ffd479;
+}
+.hljs-tag {
+  color: var(--code-ink);
+}
+.hljs-deletion {
+  color: #fb7185;
+}
+.hljs-emphasis {
+  font-style: italic;
+}
+.hljs-strong {
+  font-weight: 600;
+}
